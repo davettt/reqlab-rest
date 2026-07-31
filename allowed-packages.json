@@ -1,0 +1,226 @@
+{
+  "@eslint/js": {
+    "repo": "https://github.com/eslint/eslint",
+    "publisher": "openjsfoundation",
+    "weeklyDownloads": 134840091,
+    "versions": 88,
+    "verified": "2026-07-31"
+  },
+  "@tailwindcss/postcss": {
+    "repo": "https://github.com/tailwindlabs/tailwindcss",
+    "publisher": "reinink",
+    "weeklyDownloads": 31292250,
+    "versions": 905,
+    "verified": "2026-07-31"
+  },
+  "@types/react": {
+    "repo": "https://github.com/DefinitelyTyped/DefinitelyTyped",
+    "publisher": "types",
+    "weeklyDownloads": 144132380,
+    "versions": 706,
+    "verified": "2026-07-31"
+  },
+  "@types/react-dom": {
+    "repo": "https://github.com/DefinitelyTyped/DefinitelyTyped",
+    "publisher": "types",
+    "weeklyDownloads": 118192690,
+    "versions": 183,
+    "verified": "2026-07-31"
+  },
+  "@vitejs/plugin-react": {
+    "repo": "https://github.com/vitejs/vite-plugin-react",
+    "publisher": "yyx990803",
+    "weeklyDownloads": 69180413,
+    "versions": 86,
+    "verified": "2026-07-31"
+  },
+  "concurrently": {
+    "repo": "https://github.com/open-cli-tools/concurrently",
+    "publisher": "kimmobrunfeldt",
+    "weeklyDownloads": 20318708,
+    "versions": 71,
+    "verified": "2026-07-31"
+  },
+  "cors": {
+    "repo": "https://github.com/expressjs/cors",
+    "publisher": "dougwilson",
+    "weeklyDownloads": 71616402,
+    "versions": 35,
+    "verified": "2026-07-31"
+  },
+  "eslint": {
+    "repo": "https://github.com/eslint/eslint",
+    "publisher": "openjsfoundation",
+    "weeklyDownloads": 152812999,
+    "versions": 425,
+    "verified": "2026-07-31"
+  },
+  "eslint-plugin-import": {
+    "repo": "https://github.com/import-js/eslint-plugin-import",
+    "publisher": "benmosher",
+    "weeklyDownloads": 58634349,
+    "versions": 132,
+    "verified": "2026-07-31"
+  },
+  "eslint-plugin-react-hooks": {
+    "repo": "https://github.com/facebook/react",
+    "publisher": "react-bot",
+    "weeklyDownloads": 93273493,
+    "versions": 2734,
+    "verified": "2026-07-31"
+  },
+  "eslint-plugin-security": {
+    "repo": "https://github.com/eslint-community/eslint-plugin-security",
+    "publisher": "nzakas",
+    "weeklyDownloads": 3045043,
+    "versions": 16,
+    "verified": "2026-07-31"
+  },
+  "express": {
+    "repo": "https://github.com/expressjs/express",
+    "publisher": "wesleytodd",
+    "weeklyDownloads": 126125592,
+    "versions": 288,
+    "verified": "2026-07-31"
+  },
+  "express-rate-limit": {
+    "repo": "https://github.com/express-rate-limit/express-rate-limit",
+    "publisher": "nfriedly",
+    "weeklyDownloads": 55946467,
+    "versions": 128,
+    "verified": "2026-07-31"
+  },
+  "globals": {
+    "repo": "https://github.com/sindresorhus/globals",
+    "publisher": "byk",
+    "weeklyDownloads": 261767665,
+    "versions": 138,
+    "verified": "2026-07-31"
+  },
+  "helmet": {
+    "repo": "git://github.com/helmetjs/helmet",
+    "publisher": "adam_baldwin",
+    "weeklyDownloads": 14113006,
+    "versions": 135,
+    "verified": "2026-07-31"
+  },
+  "html-validate": {
+    "repo": "https://gitlab.com/html-validate/html-validate",
+    "publisher": "ext",
+    "weeklyDownloads": 507978,
+    "versions": 334,
+    "verified": "2026-07-31"
+  },
+  "husky": {
+    "repo": "https://github.com/typicode/husky",
+    "publisher": "typicode",
+    "weeklyDownloads": 34459287,
+    "versions": 215,
+    "verified": "2026-07-31"
+  },
+  "license-checker": {
+    "repo": "ssh://git@github.com/davglass/license-checker",
+    "publisher": "davglass",
+    "weeklyDownloads": 1001210,
+    "versions": 74,
+    "verified": "2026-07-31"
+  },
+  "postcss": {
+    "repo": "https://github.com/postcss/postcss",
+    "publisher": "ai",
+    "weeklyDownloads": 271193212,
+    "versions": 289,
+    "verified": "2026-07-31"
+  },
+  "prettier": {
+    "repo": "https://github.com/prettier/prettier",
+    "publisher": "jlongster",
+    "weeklyDownloads": 117403209,
+    "versions": 195,
+    "verified": "2026-07-31"
+  },
+  "prettier-plugin-tailwindcss": {
+    "repo": "https://github.com/tailwindlabs/prettier-plugin-tailwindcss",
+    "publisher": "malfaitrobin",
+    "weeklyDownloads": 8610967,
+    "versions": 261,
+    "verified": "2026-07-31"
+  },
+  "react": {
+    "repo": "https://github.com/react/react",
+    "publisher": "fb",
+    "weeklyDownloads": 162571068,
+    "versions": 2896,
+    "verified": "2026-07-31"
+  },
+  "react-dom": {
+    "repo": "https://github.com/react/react",
+    "publisher": "fb",
+    "weeklyDownloads": 139540348,
+    "versions": 2851,
+    "verified": "2026-07-31"
+  },
+  "stylelint": {
+    "repo": "https://github.com/stylelint/stylelint",
+    "publisher": "jeddy3",
+    "weeklyDownloads": 10481470,
+    "versions": 281,
+    "verified": "2026-07-31"
+  },
+  "stylelint-config-standard": {
+    "repo": "https://github.com/stylelint/stylelint-config-standard",
+    "publisher": "jeddy3",
+    "weeklyDownloads": 6388494,
+    "versions": 53,
+    "verified": "2026-07-31"
+  },
+  "tailwindcss": {
+    "repo": "https://github.com/tailwindlabs/tailwindcss",
+    "publisher": "malfaitrobin",
+    "weeklyDownloads": 117285467,
+    "versions": 2634,
+    "verified": "2026-07-31"
+  },
+  "typescript": {
+    "repo": "https://github.com/microsoft/TypeScript",
+    "publisher": "microsoft1es",
+    "weeklyDownloads": 252816576,
+    "versions": 3782,
+    "verified": "2026-07-31"
+  },
+  "typescript-eslint": {
+    "repo": "https://github.com/typescript-eslint/typescript-eslint",
+    "publisher": "jameshenry",
+    "weeklyDownloads": 84866650,
+    "versions": 1496,
+    "verified": "2026-07-31"
+  },
+  "undici": {
+    "repo": "https://github.com/nodejs/undici",
+    "publisher": "matteo.collina",
+    "weeklyDownloads": 147330163,
+    "versions": 299,
+    "verified": "2026-07-31"
+  },
+  "vite": {
+    "repo": "https://github.com/vitejs/vite",
+    "publisher": "yyx990803",
+    "weeklyDownloads": 143695293,
+    "versions": 747,
+    "verified": "2026-07-31"
+  },
+  "zod": {
+    "repo": "https://github.com/colinhacks/zod",
+    "publisher": "colinhacks",
+    "weeklyDownloads": 246441398,
+    "versions": 875,
+    "verified": "2026-07-31"
+  },
+  "zustand": {
+    "repo": "https://github.com/pmndrs/zustand",
+    "publisher": "daishi",
+    "weeklyDownloads": 49301264,
+    "versions": 157,
+    "verified": "2026-07-31"
+  }
+}
