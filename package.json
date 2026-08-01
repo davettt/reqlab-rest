@@ -31,9 +31,11 @@
     "validate": "npm run lint && npm run lint:html && npm run lint:css && npm run format:check && npm run type-check",
     "quality": "npm run validate && npm run sast && npm run security && npm run secrets && npm run licenses && npm run deps:check && npm run review",
     "test:unit": "node tests/unit.js",
+    "test:exec": "node tests/exec.js",
+    "test:api": "node tests/api.js",
     "test:smoke": "node tests/smoke.js",
     "test:integration": "node tests/harness.js integration",
-    "test": "npm run test:unit && npm run test:smoke && npm run test:integration",
+    "test": "npm run test:unit && npm run test:exec && npm run test:api && npm run test:smoke && npm run test:integration",
     "prepare": "husky"
   },
   "dependencies": {

@@ -6,6 +6,9 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { buildStale } from './buildCheck.js';
+import { installShutdownFlush } from './store.js';
+import { router as projectsRouter } from './routes/projects.js';
+import { router as runRouter } from './routes/run.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -86,6 +89,9 @@ app.get('/api/build-status', (_req, res) => {
   res.json({ stale: buildStale, version: pkg.version });
 });
 
+app.use('/api/projects', projectsRouter);
+app.use('/api/run', runRouter);
+
 // Must precede the SPA fallback: otherwise a typo'd or removed API route returns the HTML
 // shell with status 200 in production, and the client parses it as a successful response.
 app.use('/api', (_req, res) => {
@@ -100,9 +106,23 @@ if (process.env.NODE_ENV === 'production') {
 // Generic errors to the client; details stay in the server log.
 // eslint-disable-next-line no-unused-vars -- Express identifies error handlers by arity
 app.use((err, _req, res, _next) => {
+  // Validation failures are the user's input, not a fault: report what was wrong with it.
+  if (err?.name === 'ZodError') {
+    const issues = (err.issues ?? []).map((i) => ({
+      field: i.path.join('.') || '(root)',
+      message: i.message,
+    }));
+    return res.status(400).json({ error: 'Invalid request', issues });
+  }
+  if (err?.status && err.status < 500) {
+    return res.status(err.status).json({ error: err.message });
+  }
+
   console.error('[reqlab-rest]', err);
   res.status(500).json({ error: 'Internal server error' });
 });
+
+installShutdownFlush();
 
 app.listen(PORT, HOST, () => {
   console.log(`ReqLab REST v${pkg.version} listening on http://${HOST}:${PORT}`);

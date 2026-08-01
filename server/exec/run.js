@@ -7,6 +7,7 @@
  * origin — a silent auth leak that most clients hide.
  */
 import dns from 'dns';
+import net from 'net';
 import { Agent, buildConnector, request as undiciRequest } from 'undici';
 import { buildBody, isTextualContentType } from './bodies.js';
 import { applyAuth } from './auth.js';
@@ -16,12 +17,19 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MAX_REDIRECTS = 5;
 
-/** Header values that are credentials by nature — masked regardless of variable origin. */
+/**
+ * Request headers that carry credentials by nature, masked regardless of where the value came
+ * from — Basic auth base64-encodes the secret, so value matching alone would miss it.
+ *
+ * `set-cookie` is deliberately absent. It is a *response* header: data the user is inspecting,
+ * not a stored credential of theirs. Masking it made the Cookies tab useless (`theme=••••`)
+ * while the same value stayed visible in the response body, which is inconsistent as well as
+ * unhelpful. Anything that genuinely is a secret still gets masked by value.
+ */
 const SENSITIVE_HEADERS = new Set([
   'authorization',
   'proxy-authorization',
   'cookie',
-  'set-cookie',
   'x-api-key',
   'x-auth-token',
   'api-key',
@@ -286,6 +294,11 @@ async function sendOnce({
   };
 }
 
+/** Literal IPv4/IPv6 addresses skip name resolution entirely. */
+function isIpLiteral(hostname) {
+  return net.isIP(hostname.replace(/^\[|\]$/g, '')) !== 0;
+}
+
 function instrumentedAgent(timing, timeoutMs) {
   const baseConnect = buildConnector({ timeout: timeoutMs });
 
@@ -293,20 +306,28 @@ function instrumentedAgent(timing, timeoutMs) {
     connections: 1,
     pipelining: 0,
     connect(opts, callback) {
-      const connectStart = performance.now();
+      const hostname = opts.hostname ?? opts.host ?? '';
 
-      const lookup = (hostname, lookupOpts, cb) => {
-        const dnsStart = performance.now();
-        dns.lookup(hostname, lookupOpts, (...args) => {
-          timing.dnsMs = round(performance.now() - dnsStart);
-          cb(...args);
+      // undici's connector does not forward a custom `lookup`, so resolution is timed with
+      // an explicit call here and the connector then resolves as usual. The second lookup
+      // is served from the OS cache, so this measures real resolution cost without
+      // changing how the connection is actually made. For an IP literal it stays null,
+      // because no resolution happens at all.
+      const finish = () => {
+        const connectStart = performance.now();
+        baseConnect(opts, (err, socket) => {
+          // TCP + TLS. DNS is reported separately above.
+          timing.connectMs = round(performance.now() - connectStart);
+          callback(err, socket);
         });
       };
 
-      baseConnect({ ...opts, lookup }, (err, socket) => {
-        // Covers DNS + TCP + TLS; the DNS slice is subtracted in the UI waterfall.
-        timing.connectMs = round(performance.now() - connectStart);
-        callback(err, socket);
+      if (!hostname || isIpLiteral(hostname)) return finish();
+
+      const dnsStart = performance.now();
+      dns.lookup(hostname, { all: false }, () => {
+        timing.dnsMs = round(performance.now() - dnsStart);
+        finish();
       });
     },
   });
@@ -486,12 +507,6 @@ export function sanitiseRun(run, scope) {
   if (masked.request) masked.request.headers = maskHeaders(masked.request.headers);
   if (masked.finalRequest) masked.finalRequest.headers = maskHeaders(masked.finalRequest.headers);
   if (masked.response) masked.response.headers = maskHeaders(masked.response.headers);
-  if (masked.response?.cookies) {
-    masked.response.cookies = masked.response.cookies.map((c) => ({
-      ...c,
-      value: maskCredential(c.value),
-    }));
-  }
   return masked;
 }
 
