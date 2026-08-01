@@ -6,6 +6,8 @@
  * the client without passing through maskDeep() first.
  */
 
+import crypto from 'crypto';
+
 /**
  * Apply an auth config to a request in place.
  *
@@ -76,7 +78,54 @@ const tokenCache = new Map();
 const EXPIRY_SKEW_MS = 30_000;
 
 function cacheKey(auth) {
-  return [auth.tokenUrl, auth.clientId, auth.scope ?? '', auth.audience ?? ''].join('|');
+  // The secret is part of the identity of a token: rotate it and the cached token must not
+  // be reused. Hashed, never stored raw — this map would otherwise hold live credentials.
+  const secretFingerprint = crypto
+    .createHash('sha256')
+    .update(auth.clientSecret ?? '')
+    .digest('hex')
+    .slice(0, 16);
+
+  return [
+    auth.tokenUrl,
+    auth.clientId,
+    auth.scope ?? '',
+    auth.audience ?? '',
+    auth.clientAuth ?? 'header',
+    secretFingerprint,
+  ].join('|');
+}
+
+/**
+ * The client secret is about to be put on the wire, so the destination is checked first:
+ * https anywhere, http only against loopback (local dev), nothing else.
+ */
+function validateTokenUrl(rawUrl, warnings) {
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    warnings.push(`The OAuth2 token URL "${rawUrl}" is not a valid URL.`);
+    return null;
+  }
+
+  if (url.protocol === 'https:') return url;
+
+  if (url.protocol === 'http:') {
+    const loopback = ['localhost', '127.0.0.1', '[::1]', '::1'].includes(url.hostname);
+    if (!loopback) {
+      warnings.push(
+        `Refusing to send the client secret to ${url.origin} over plain http — it would be ` +
+          'readable by anything on the network path. Use https, or a loopback address for ' +
+          'local development.',
+      );
+      return null;
+    }
+    return url;
+  }
+
+  warnings.push(`Unsupported scheme "${url.protocol}" for the OAuth2 token URL.`);
+  return null;
 }
 
 async function clientCredentialsToken(auth, warnings) {
@@ -84,6 +133,9 @@ async function clientCredentialsToken(auth, warnings) {
     warnings.push('OAuth2 client credentials needs both a token URL and a client ID.');
     return null;
   }
+
+  const tokenUrl = validateTokenUrl(auth.tokenUrl, warnings);
+  if (!tokenUrl) return null;
 
   const key = cacheKey(auth);
   const cached = tokenCache.get(key);
@@ -104,7 +156,7 @@ async function clientCredentialsToken(auth, warnings) {
 
   let res;
   try {
-    res = await fetch(auth.tokenUrl, {
+    res = await fetch(tokenUrl, {
       method: 'POST',
       headers,
       body: params.toString(),

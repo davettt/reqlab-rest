@@ -133,6 +133,12 @@ export function save(relativePath, data, { debounceMs = DEFAULT_DEBOUNCE_MS } = 
     resolveFlush = resolve;
     rejectFlush = reject;
   });
+  // save() is designed to be fire-and-forget, so nothing may be awaiting this promise when a
+  // write fails. Without a handler attached here that becomes an unhandled rejection, which
+  // takes the whole server down. Callers that do await still receive the rejection.
+  // Constant format string: the path is data, and interpolating it would let a crafted
+  // filename inject format specifiers and forge log lines.
+  promise.catch((err) => console.error('[reqlab-rest] deferred write failed:', relativePath, err));
 
   const entry = { data, promise, resolveFlush, rejectFlush, timer: null };
   // Deliberately not unref'd: a pending write must keep the process alive until it lands,
@@ -248,8 +254,19 @@ export async function migrateDocument(doc, { targetVersion, migrations, label })
   while (current < targetVersion) {
     const step = migrations[current];
     if (!step) throw new Error(`No migration from schema v${current} for ${label}`);
+
+    const before = current;
     migrated = step(migrated);
     current = migrated.schemaVersion ?? current + 1;
+
+    // A step that returns the same (or an older) version would loop forever, hanging the
+    // request that triggered the load rather than failing it.
+    if (current <= before) {
+      throw new Error(
+        `Migration from schema v${before} for ${label} did not advance the version ` +
+          `(returned v${current}).`,
+      );
+    }
   }
   return migrated;
 }
@@ -259,7 +276,6 @@ let backupTaken = false;
 /** One snapshot of local_data/ per process, kept to the last 10, before any migration runs. */
 async function backupBeforeMigration(fromVersion) {
   if (backupTaken) return;
-  backupTaken = true;
 
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const dest = path.join(DATA_ROOT, 'backups', `${stamp}-v${fromVersion}`);
@@ -277,6 +293,10 @@ async function backupBeforeMigration(fromVersion) {
   for (const old of all.slice(0, Math.max(0, all.length - 10))) {
     await fsp.rm(path.join(backupsRoot, old), { recursive: true, force: true });
   }
+
+  // Only now: if any step above threw, the next migration attempt must try again rather
+  // than proceed believing a backup exists.
+  backupTaken = true;
 }
 
 /* ---------------------------------------------------------------- *
@@ -306,7 +326,12 @@ export function installShutdownFlush() {
     for (const [full, entry] of pendingWrites) {
       try {
         fs.mkdirSync(path.dirname(full), { recursive: true });
-        fs.writeFileSync(full, JSON.stringify(entry.data, null, 2), 'utf8');
+        // Still atomic, even on this path: writing the target directly would leave a
+        // half-written file if the process dies mid-write, which is the exact failure
+        // this module exists to prevent.
+        const tmp = `${full}.${process.pid}.exit.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(entry.data, null, 2), 'utf8');
+        fs.renameSync(tmp, full);
       } catch {
         /* nothing useful to do while exiting */
       }

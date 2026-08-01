@@ -1,4 +1,6 @@
 import { spawn } from 'child_process';
+import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -19,9 +21,13 @@ export async function startServer({
   env = {},
   script = 'server/index.js',
 } = {}) {
+  // Never let a test touch the developer's real local_data/. Each server gets a throwaway
+  // data directory, removed by stop().
+  const dataDir = env.REQLAB_DATA_DIR ?? fs.mkdtempSync(path.join(os.tmpdir(), 'reqlab-test-'));
+
   const child = spawn(process.execPath, [script], {
     cwd: ROOT,
-    env: { ...process.env, ...env, PORT: String(port) },
+    env: { ...process.env, ...env, PORT: String(port), REQLAB_DATA_DIR: dataDir },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
@@ -32,11 +38,12 @@ export async function startServer({
   const base = `http://127.0.0.1:${port}`;
   const deadline = Date.now() + 15000;
   for (;;) {
-    if (child.exitCode !== null) {
-      throw new Error(`Server exited early (code ${child.exitCode}):\n${log}`);
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`Server exited early (code ${child.exitCode ?? child.signalCode}):\n${log}`);
     }
     try {
-      const res = await fetch(`${base}/api/build-status`);
+      // Bounded per attempt, so one hung request cannot outlive the overall deadline.
+      const res = await fetch(`${base}/api/build-status`, { signal: AbortSignal.timeout(2000) });
       if (res.ok) break;
     } catch {
       /* not up yet */
@@ -51,13 +58,21 @@ export async function startServer({
   return {
     port,
     base,
+    dataDir,
     get log() {
       return log;
     },
     async stop() {
-      if (child.exitCode !== null) return;
-      child.kill('SIGTERM');
-      await once(child, 'exit', 5000).catch(() => child.kill('SIGKILL'));
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit', 5000).catch(async () => {
+          // SIGTERM ignored — escalate and actually wait, so the process is gone before
+          // the temp directory is removed underneath it.
+          child.kill('SIGKILL');
+          await once(child, 'exit', 5000).catch(() => {});
+        });
+      }
+      if (!env.REQLAB_DATA_DIR) fs.rmSync(dataDir, { recursive: true, force: true });
     },
   };
 }

@@ -127,6 +127,9 @@ export function encryptWithPassphrase(plaintext, passphrase) {
 
 export function decryptWithPassphrase(value, passphrase) {
   if (!isPassphraseEncrypted(value)) return value ?? '';
+  // Checked before any crypto runs, so a missing passphrase says so plainly instead of
+  // surfacing as "wrong passphrase, or the bundle is corrupt".
+  if (!passphrase) throw new Error('A passphrase is required to decrypt this export bundle.');
   const payload = Buffer.from(value.slice(PASSPHRASE_PREFIX.length), 'base64');
   const salt = payload.subarray(0, SALT_BYTES);
   try {

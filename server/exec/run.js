@@ -48,8 +48,11 @@ export async function executeRequest(def, options = {}) {
   const warnings = [];
   const missing = new Set();
 
+  const varErrors = new Set();
+
   const collect = (result) => {
     result.missing.forEach((k) => missing.add(k));
+    (result.errors ?? []).forEach((e) => varErrors.add(e));
     return result;
   };
 
@@ -81,10 +84,18 @@ export async function executeRequest(def, options = {}) {
   const headers = new Headers();
   for (const header of def.headers ?? []) {
     if (!header.key || header.enabled === false) continue;
-    headers.set(
-      collect(interpolate(header.key, scope)).text,
-      collect(interpolate(header.value ?? '', scope)).text,
-    );
+    const name = collect(interpolate(header.key, scope)).text;
+    const value = collect(interpolate(header.value ?? '', scope)).text;
+    try {
+      headers.set(name, value);
+    } catch {
+      // Deliberately does not echo the resolved name: it may have come from a secret
+      // variable, and an error message is not a place a secret may surface.
+      throw new HttpRequestError(
+        'A request header is not valid. Header names cannot contain spaces or separators, ' +
+          'and values cannot contain newlines.',
+      );
+    }
   }
 
   const resolvedBodyDef = collect(interpolateDeep(def.body ?? { type: 'none' }, scope)).value;
@@ -93,8 +104,18 @@ export async function executeRequest(def, options = {}) {
   if (contentType && !headers.has('content-type')) headers.set('content-type', contentType);
 
   const resolvedAuth = collect(interpolateDeep(def.auth ?? { type: 'none' }, scope)).value;
-  const authResult = await applyAuth(resolvedAuth, headers, url);
+  let authResult;
+  try {
+    authResult = await applyAuth(resolvedAuth, headers, url);
+  } catch (err) {
+    if (err instanceof HttpRequestError) throw err;
+    throw new HttpRequestError(`Could not apply authentication: ${err.message}`, err);
+  }
   warnings.push(...authResult.warnings);
+
+  for (const err of varErrors) {
+    warnings.push(`Variable could not be decrypted — ${err}`);
+  }
 
   if (missing.size) {
     warnings.push(
@@ -108,6 +129,7 @@ export async function executeRequest(def, options = {}) {
   /* ---- send, following redirects by hand ----------------------- */
 
   const redirects = [];
+  const firstHopHeaders = new Headers(headers);
   let currentUrl = url;
   let currentMethod = method;
   let currentBody = payload;
@@ -184,9 +206,15 @@ export async function executeRequest(def, options = {}) {
     request: {
       method,
       url: url.toString(),
-      finalUrl: currentUrl.toString(),
-      headers: headersToObject(currentHeaders),
+      // The headers actually sent on the first hop — kept consistent with url and body.
+      // Credentials may have been dropped later, which finalRequest reflects.
+      headers: headersToObject(firstHopHeaders),
       body: describeSentBody(resolvedBodyDef, payload),
+    },
+    finalRequest: {
+      method: currentMethod,
+      url: currentUrl.toString(),
+      headers: headersToObject(currentHeaders),
     },
     response,
     redirects,
@@ -366,9 +394,11 @@ function parseSetCookies(setCookie) {
   return list.map((raw) => {
     const [pair, ...attrs] = raw.split(';');
     const eq = pair.indexOf('=');
+    // A first segment with no '=' is malformed; treat the whole segment as the name rather
+    // than slicing at -1, which would silently produce an empty name and duplicate the value.
     const cookie = {
-      name: pair.slice(0, eq).trim(),
-      value: pair.slice(eq + 1).trim(),
+      name: eq === -1 ? pair.trim() : pair.slice(0, eq).trim(),
+      value: eq === -1 ? '' : pair.slice(eq + 1).trim(),
       httpOnly: false,
       secure: false,
     };
@@ -454,6 +484,7 @@ export function sanitiseRun(run, scope) {
   };
 
   if (masked.request) masked.request.headers = maskHeaders(masked.request.headers);
+  if (masked.finalRequest) masked.finalRequest.headers = maskHeaders(masked.finalRequest.headers);
   if (masked.response) masked.response.headers = maskHeaders(masked.response.headers);
   if (masked.response?.cookies) {
     masked.response.cookies = masked.response.cookies.map((c) => ({

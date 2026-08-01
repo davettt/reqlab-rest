@@ -49,8 +49,37 @@ try {
     assertEqual(
       good.headers.get('access-control-allow-origin'),
       'http://localhost:5173',
-      'localhost origin should be allowed',
+      'the Vite dev origin should be allowed',
     );
+
+    // Another process on loopback is not part of this app.
+    const otherLocalApp = await fetch(`${server.base}/api/build-status`, {
+      headers: { Origin: 'http://localhost:3000' },
+    });
+    assertEqual(
+      otherLocalApp.headers.get('access-control-allow-origin'),
+      null,
+      'an unrelated local origin must not be allowed',
+    );
+  });
+  await test('production: SPA fallback serves pages but never swallows API 404s', async () => {
+    // The dev-mode 404 test above passes even when the SPA fallback is misordered, because
+    // static serving is only mounted in production. This is the case that actually broke.
+    const prod = await startServer({ env: { NODE_ENV: 'production' } });
+    try {
+      const api = await fetch(`${prod.base}/api/does-not-exist`);
+      assertEqual(api.status, 404, 'unknown API route status');
+      assert(
+        (api.headers.get('content-type') ?? '').includes('json'),
+        'must be a JSON error, not the HTML shell with status 200',
+      );
+
+      const page = await fetch(`${prod.base}/some/deep/route`);
+      assertEqual(page.status, 200, 'deep link status');
+      assert((page.headers.get('content-type') ?? '').includes('html'), 'deep link serves the app');
+    } finally {
+      await prod.stop();
+    }
   });
 } finally {
   await server.stop();

@@ -194,6 +194,23 @@ await test('store: refuses to downgrade newer data', async () => {
   assert(threw, 'newer schema must refuse to load rather than be overwritten');
 });
 
+await test('store: a migration that does not advance the version fails instead of looping', async () => {
+  let threw = false;
+  try {
+    await store.migrateDocument(
+      { schemaVersion: 1 },
+      {
+        targetVersion: 3,
+        label: 'project.json',
+        migrations: { 1: (doc) => ({ ...doc, schemaVersion: 1 }) },
+      },
+    );
+  } catch {
+    threw = true;
+  }
+  assert(threw, 'a non-advancing migration must throw, not hang');
+});
+
 await test('store: remove cancels a pending write', async () => {
   store.save('projects/p1/doomed.json', { x: 1 }, { debounceMs: 5000 });
   await store.remove('projects/p1/doomed.json');
@@ -267,6 +284,44 @@ await test('vars: non-secret values are not masked', () => {
     'https://staging.example.com',
     'only secrets are masked',
   );
+});
+
+await test('vars: an undecryptable secret is reported per variable, not fatal', () => {
+  const foreignKey = nodeCrypto.createHash('sha256').update('another-machine').digest();
+  const iv = nodeCrypto.randomBytes(12);
+  const cipher = nodeCrypto.createCipheriv('aes-256-gcm', foreignKey, iv, { authTagLength: 16 });
+  const ct = Buffer.concat([cipher.update('their-secret', 'utf8'), cipher.final()]);
+  const foreign = 'enc:' + Buffer.concat([iv, cipher.getAuthTag(), ct]).toString('base64');
+
+  const broken = vars.buildScope({
+    envVars: [
+      { key: 'good', value: 'https://api.example.com' },
+      { key: 'bad', value: foreign, secret: true },
+    ],
+  });
+
+  // The healthy variable must still work.
+  assertEqual(vars.interpolate('{{good}}', broken).text, 'https://api.example.com');
+
+  const r = vars.interpolate('{{bad}}', broken);
+  assertEqual(r.errors.length, 1, 'the failure is reported when referenced');
+  assert(r.errors[0].startsWith('bad:'), 'names the offending variable');
+});
+
+await test('vars: masking covers object keys as well as values', () => {
+  const masked = vars.maskDeep({ 'sk-secret-value-1234': 'x' }, scope);
+  assert(!JSON.stringify(masked).includes('sk-secret-value-1234'), 'key must be masked too');
+});
+
+await test('vars: colliding masked keys do not drop values', () => {
+  const s2 = vars.buildScope({
+    envVars: [
+      { key: 'a', value: 'secret-alpha-value', secret: true },
+      { key: 'b', value: 'secret-beta-value', secret: true },
+    ],
+  });
+  const masked = vars.maskDeep({ 'secret-alpha-value': 1, 'secret-beta-value': 2 }, s2);
+  assertEqual(Object.keys(masked).length, 2, 'both entries must survive masking');
 });
 
 await test('vars: interpolateDeep walks objects and arrays', () => {

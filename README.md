@@ -7,7 +7,10 @@ and get an evidence-backed answer to _"was this built correctly?"_: contract con
 handling, authorisation, pagination, idempotency, caching, latency and rate limits, delivered as
 a report you can hand to an engineer.
 
-Runs entirely on your machine. No account, no cloud, no telemetry. MIT licensed.
+No account, no telemetry, MIT licensed. Your projects, requests and secrets never leave your
+machine — with one deliberate exception: if you use the AI import feature, the docs you give it
+are sent to whichever provider you configured (Anthropic or OpenAI), under your own API key.
+Everything else, including every request the client sends and every lab run, is local.
 
 > **Status: in development.** Phase 0 (project scaffold and server skeleton) is complete.
 > The client and lab features listed below are being built phase by phase — see `CHANGELOG.md`
@@ -44,7 +47,7 @@ Runs entirely on your machine. No account, no cloud, no telemetry. MIT licensed.
 
 ## Requirements
 
-- Node.js 22 or newer
+- Node.js 22.12 or newer
 - pm2 (optional, for running it as a background local service)
 
 ## Setup

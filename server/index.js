@@ -46,6 +46,8 @@ app.use(
 // Loopback origins only. Parsed rather than pattern-matched: a regex here has to be anchored
 // exactly right or "localhost.attacker.example" slips through, and parsing cannot get that wrong.
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
+const VITE_DEV_PORT = '5173';
+const ALLOWED_ORIGIN_PORTS = new Set([String(PORT), VITE_DEV_PORT]);
 
 app.use(
   cors({
@@ -53,8 +55,13 @@ app.use(
       // No Origin header — a curl or same-origin request, not a cross-site one.
       if (!origin) return callback(null, true);
       try {
-        const { protocol, hostname } = new URL(origin);
-        const ok = (protocol === 'http:' || protocol === 'https:') && LOOPBACK_HOSTS.has(hostname);
+        const { protocol, hostname, port } = new URL(origin);
+        const ok =
+          (protocol === 'http:' || protocol === 'https:') &&
+          LOOPBACK_HOSTS.has(hostname) &&
+          // Only this server and the Vite dev server. Any other local process listening on
+          // loopback is not part of this app and has no business calling its API.
+          ALLOWED_ORIGIN_PORTS.has(port || (protocol === 'https:' ? '443' : '80'));
         return callback(null, ok);
       } catch {
         return callback(null, false);
@@ -77,6 +84,12 @@ app.use(express.json({ limit: '10mb' }));
 
 app.get('/api/build-status', (_req, res) => {
   res.json({ stale: buildStale, version: pkg.version });
+});
+
+// Must precede the SPA fallback: otherwise a typo'd or removed API route returns the HTML
+// shell with status 200 in production, and the client parses it as a successful response.
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'Not found' });
 });
 
 if (process.env.NODE_ENV === 'production') {

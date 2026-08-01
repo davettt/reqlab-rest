@@ -24,18 +24,36 @@ export function buildScope({ projectVars = [], envVars = [], captures = {} } = {
   const add = (list) => {
     for (const v of list) {
       if (!v || !v.key || v.enabled === false) continue;
-      scope.set(v.key, {
-        value: v.secret ? decrypt(v.value) : (v.value ?? ''),
-        secret: Boolean(v.secret),
-      });
+
+      let value = v.value ?? '';
+      let error = null;
+      if (v.secret) {
+        try {
+          value = decrypt(v.value);
+        } catch (err) {
+          // Recorded per variable rather than thrown: one secret encrypted on another
+          // machine must not make every other variable in the environment unusable.
+          value = '';
+          error = err.message;
+        }
+      }
+
+      scope.set(v.key, { value, secret: Boolean(v.secret), error });
     }
   };
 
   add(projectVars);
   add(envVars);
 
-  for (const [key, value] of Object.entries(captures)) {
-    scope.set(key, { value: String(value ?? ''), secret: false });
+  for (const [key, capture] of Object.entries(captures)) {
+    // A capture can hold a token pulled out of a login response, so it must be able to carry
+    // the secret flag — otherwise maskText would never redact it.
+    const isWrapped = capture && typeof capture === 'object' && 'value' in capture;
+    scope.set(key, {
+      value: String((isWrapped ? capture.value : capture) ?? ''),
+      secret: isWrapped ? Boolean(capture.secret) : false,
+      error: null,
+    });
   }
 
   return scope;
@@ -48,10 +66,11 @@ export function buildScope({ projectVars = [], envVars = [], captures = {} } = {
  * warn about typos ("{{basUrl}}") instead of silently sending a literal "{{basUrl}}" upstream.
  */
 export function interpolate(input, scope, depth = 0) {
-  if (typeof input !== 'string') return { text: input, missing: [], secretsUsed: [] };
+  if (typeof input !== 'string') return { text: input, missing: [], secretsUsed: [], errors: [] };
 
   const missing = new Set();
   const secretsUsed = new Set();
+  const errors = new Set();
 
   const text = input.replace(PLACEHOLDER, (match, key) => {
     const entry = scope.get(key);
@@ -59,32 +78,47 @@ export function interpolate(input, scope, depth = 0) {
       missing.add(key);
       return match;
     }
+    // Surfaced only when the broken variable is actually referenced.
+    if (entry.error) errors.add(`${key}: ${entry.error}`);
     if (entry.secret) secretsUsed.add(key);
 
     // A variable may itself reference another variable; bounded to avoid a cycle spinning.
-    if (depth < MAX_NESTING && PLACEHOLDER.test(entry.value)) {
-      PLACEHOLDER.lastIndex = 0;
+    PLACEHOLDER.lastIndex = 0;
+    const isNested = PLACEHOLDER.test(entry.value);
+    PLACEHOLDER.lastIndex = 0;
+
+    if (isNested && depth >= MAX_NESTING) {
+      // Report rather than return a value still containing placeholders, which would be
+      // sent upstream looking like a resolved value.
+      errors.add(`${key}: variable nesting is deeper than ${MAX_NESTING} levels`);
+      return match;
+    }
+
+    if (isNested) {
       const nested = interpolate(entry.value, scope, depth + 1);
       nested.missing.forEach((k) => missing.add(k));
       nested.secretsUsed.forEach((k) => secretsUsed.add(k));
+      nested.errors.forEach((e) => errors.add(e));
       return nested.text;
     }
     return entry.value;
   });
 
-  return { text, missing: [...missing], secretsUsed: [...secretsUsed] };
+  return { text, missing: [...missing], secretsUsed: [...secretsUsed], errors: [...errors] };
 }
 
 /** Interpolate every string in a nested structure, accumulating what was missing. */
 export function interpolateDeep(value, scope) {
   const missing = new Set();
   const secretsUsed = new Set();
+  const errors = new Set();
 
   const walk = (node) => {
     if (typeof node === 'string') {
       const r = interpolate(node, scope);
       r.missing.forEach((k) => missing.add(k));
       r.secretsUsed.forEach((k) => secretsUsed.add(k));
+      r.errors.forEach((e) => errors.add(e));
       return r.text;
     }
     if (Array.isArray(node)) return node.map(walk);
@@ -94,7 +128,12 @@ export function interpolateDeep(value, scope) {
     return node;
   };
 
-  return { value: walk(value), missing: [...missing], secretsUsed: [...secretsUsed] };
+  return {
+    value: walk(value),
+    missing: [...missing],
+    secretsUsed: [...secretsUsed],
+    errors: [...errors],
+  };
 }
 
 /**
@@ -122,7 +161,19 @@ export function maskDeep(value, scope) {
   if (typeof value === 'string') return maskText(value, scope);
   if (Array.isArray(value)) return value.map((v) => maskDeep(v, scope));
   if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, maskDeep(v, scope)]));
+    // Two different secret keys can mask to the same string; without disambiguation
+    // Object.fromEntries would silently drop all but the last value.
+    const used = new Set();
+    return Object.fromEntries(
+      Object.entries(value).map(([k, v]) => {
+        const base = maskText(k, scope);
+        let key = base;
+        let n = 2;
+        while (used.has(key)) key = `${base} (${n++})`;
+        used.add(key);
+        return [key, maskDeep(v, scope)];
+      }),
+    );
   }
   return value;
 }
