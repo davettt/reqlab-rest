@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- CI workflow synced with build-policy 2.6.2, which adds build, unit, smoke and integration test steps — CI previously verified only that the code was well-formed, never that it runs
+
 ## [0.1.0] - 2026-07-31
 
 ### Added
