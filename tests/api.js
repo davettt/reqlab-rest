@@ -319,6 +319,113 @@ try {
     assertEqual(r.status, 400, 'status');
   });
 
+  /* ---- import merge behaviour --------------------------------- */
+
+  await test('importing into an existing environment keeps values already set', async () => {
+    const spec = JSON.stringify({
+      openapi: '3.0.0',
+      info: { title: 'Merge test', version: '1' },
+      servers: [{ url: 'https://api.merge.example' }],
+      components: { securitySchemes: { bearerAuth: { type: 'http', scheme: 'bearer' } } },
+      security: [{ bearerAuth: [] }],
+      paths: { '/x': { get: { summary: 'X', responses: { 200: { description: 'ok' } } } } },
+    });
+
+    const preview = await api('POST', '/import/preview', { text: spec });
+    assertEqual(preview.status, 200, 'preview');
+
+    // First import: into the environment that already holds the user's real token.
+    const first = await api('POST', '/import/apply', {
+      projectId,
+      environmentId,
+      requests: preview.body.requests,
+      variables: preview.body.variables,
+    });
+    assertEqual(first.status, 201, 'applied');
+    assertEqual(first.body.environmentId, environmentId, 'used the existing environment');
+
+    const envs = await api('GET', `/projects/${projectId}/environments`);
+    assertEqual(envs.body.environments.length, 1, 'no second environment was created');
+
+    // The token the user had already filled in must survive a later import that proposes
+    // the same variable empty — otherwise re-importing silently breaks every request.
+    const run = await api('POST', '/run', {
+      projectId,
+      environmentId,
+      request: {
+        name: 'still works',
+        method: 'GET',
+        url: '{{baseUrl}}/auth/bearer',
+        auth: { type: 'bearer', token: '{{token}}' },
+      },
+    });
+    assertEqual(run.body.response.status, 200, 'the pre-existing secret still authenticates');
+  });
+
+  await test('importing without an environmentId creates one', async () => {
+    const spec = JSON.stringify({
+      openapi: '3.0.0',
+      info: { title: 'New env', version: '1' },
+      servers: [{ url: 'https://api.new.example' }],
+      paths: { '/y': { get: { summary: 'Y', responses: { 200: { description: 'ok' } } } } },
+    });
+    const preview = await api('POST', '/import/preview', { text: spec });
+
+    const applied = await api('POST', '/import/apply', {
+      projectId,
+      environmentName: 'Created by import',
+      requests: preview.body.requests,
+      variables: preview.body.variables,
+    });
+    assertEqual(applied.status, 201, 'applied');
+    assert(applied.body.environmentId, 'a new environment id came back');
+
+    const envs = await api('GET', `/projects/${projectId}/environments`);
+    assertEqual(envs.body.environments.length, 2, 'now there are two');
+  });
+
+  await test('importing into a missing environment is a 404', async () => {
+    const applied = await api('POST', '/import/apply', {
+      projectId,
+      environmentId: 'does-not-exist',
+      requests: [],
+      variables: [{ key: 'x', value: '1', enabled: true, secret: false }],
+    });
+    assertEqual(applied.status, 404, 'status');
+  });
+
+  await test('stored verification runs are capped', async () => {
+    // Each run holds request and response evidence per finding, so an unbounded history
+    // would grow local_data indefinitely.
+    const target = (await api('POST', '/projects', { name: 'Run cap' })).body;
+    await api('POST', `/projects/${target.id}/environments`, {
+      name: 'local',
+      variables: [{ key: 'baseUrl', value: fixture.base, enabled: true, secret: false }],
+    });
+    const env = (await api('GET', `/projects/${target.id}/environments`)).body.environments[0];
+    await api('POST', `/projects/${target.id}/requests`, {
+      name: 'echo',
+      method: 'GET',
+      url: '{{baseUrl}}/echo',
+    });
+
+    for (let i = 0; i < 22; i += 1) {
+      await api('POST', '/verify', {
+        projectId: target.id,
+        suites: ['contract'],
+        environmentIds: [env.id],
+      });
+    }
+
+    const listed = await api('GET', `/verify/${target.id}/runs`);
+    assert(
+      listed.body.runs.length <= 20,
+      `expected at most 20 stored runs, got ${listed.body.runs.length}`,
+    );
+
+    await api('DELETE', `/projects/${target.id}`);
+  });
+
   /* ---- deletion ----------------------------------------------- */
 
   await test('deleting a project removes its requests too', async () => {

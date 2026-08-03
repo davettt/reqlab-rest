@@ -1,12 +1,16 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useStore } from './stores/appStore';
 import Sidebar from './components/Sidebar';
 import EnvironmentBar from './components/EnvironmentBar';
 import RequestEditor from './components/RequestEditor';
 import ResponsePane from './components/ResponsePane';
+import SettingsDialog from './components/SettingsDialog';
+import LabPanel from './components/LabPanel';
 
 export default function App() {
   const { loadProjects, error, clearError, project, projects, loading } = useStore();
+  const [showSettings, setShowSettings] = useState(false);
+  const [showLab, setShowLab] = useState(false);
 
   useEffect(() => {
     void loadProjects();
@@ -17,7 +21,25 @@ export default function App() {
       <header className="flex items-center gap-3 border-b border-slate-800 px-4 py-2">
         <h1 className="text-sm font-semibold text-slate-100">ReqLab REST</h1>
         <span className="text-xs text-slate-600">local · nothing leaves this machine</span>
+        <button
+          type="button"
+          onClick={() => setShowLab(true)}
+          disabled={!project}
+          className="ml-auto text-xs text-slate-500 hover:text-slate-200 disabled:opacity-40"
+        >
+          Lab
+        </button>
+        <button
+          type="button"
+          onClick={() => setShowSettings(true)}
+          className="text-xs text-slate-500 hover:text-slate-200"
+        >
+          Settings
+        </button>
       </header>
+
+      {showSettings && <SettingsDialog onClose={() => setShowSettings(false)} />}
+      {showLab && <LabPanel onClose={() => setShowLab(false)} />}
 
       {error && (
         <div className="flex items-center justify-between gap-4 bg-rose-950/50 px-4 py-2 text-sm text-rose-300">

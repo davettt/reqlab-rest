@@ -22,6 +22,10 @@ const keyValue = z.object({
   key: z.string().max(1000).default(''),
   value: z.string().max(100_000).default(''),
   enabled: z.boolean().default(true),
+  // When the documentation states a closed set of values, carry them so the editor can offer
+  // a choice instead of asking the user to remember what the docs said.
+  options: z.array(z.string().max(200)).max(100).optional(),
+  description: z.string().max(1000).optional(),
 });
 
 const bodySchema = z.object({

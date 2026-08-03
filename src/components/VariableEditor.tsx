@@ -90,9 +90,16 @@ export default function VariableEditor({ variables, onSave }: Props) {
                 if (row.secret && e.target.value === MASK) update(index, { value: '' });
               }}
               placeholder={row.secret ? 'Secret value' : 'Value'}
-              type={row.secret ? 'password' : 'text'}
+              type="text"
               autoComplete="off"
-              className={`${input} flex-1 font-mono`}
+              spellCheck={false}
+              data-lpignore="true"
+              data-1p-ignore=""
+              data-form-type="other"
+              // Masked via CSS rather than type="password": a password input makes the
+              // browser offer to save the value as an account credential, which would copy
+              // an API key into its vault and sync it to the cloud.
+              className={`${input} flex-1 font-mono ${row.secret ? '[-webkit-text-security:disc]' : ''}`}
             />
 
             <label

@@ -73,6 +73,17 @@ export async function executeRequest(def, options = {}) {
   try {
     url = new URL(rawUrl);
   } catch {
+    // An unresolved {{placeholder}} is by far the most common cause, and "not a valid URL"
+    // sends people looking for a typo instead of the empty variable behind it.
+    const unresolved = [...rawUrl.matchAll(/\{\{\s*([\w.-]+)\s*\}\}/g)].map((m) => m[1]);
+    if (unresolved.length) {
+      throw new HttpRequestError(
+        `The URL still contains ${unresolved.map((v) => `{{${v}}}`).join(', ')}. ` +
+          'Select an environment that defines ' +
+          (unresolved.length > 1 ? 'those variables' : 'that variable') +
+          ', or give them a value under Variables.',
+      );
+    }
     throw new HttpRequestError(
       `"${rawUrl}" is not a valid URL. Include the scheme, e.g. https://api.example.com.`,
     );
@@ -125,10 +136,18 @@ export async function executeRequest(def, options = {}) {
     warnings.push(`Variable could not be decrypted — ${err}`);
   }
 
+  // Refuse rather than warn. An unresolved placeholder is never intended: in a URL it asks
+  // for a path called %7B%7Bid%7D%7D, and in a JSON body it produces invalid JSON — both of
+  // which surface as a confusing complaint from the API rather than the real cause, which is
+  // an empty variable. Deliberately malformed input is still possible by typing it.
   if (missing.size) {
-    warnings.push(
-      `Unresolved variable${missing.size > 1 ? 's' : ''}: ${[...missing].join(', ')}. ` +
-        'The placeholder was sent literally.',
+    const names = [...missing];
+    const plural = names.length > 1;
+    throw new HttpRequestError(
+      `${names.map((n) => `{{${n}}}`).join(', ')} ${plural ? 'have' : 'has'} no value, so ` +
+        `${plural ? 'they were' : 'it was'} left in the request as ` +
+        `${plural ? 'placeholders' : 'a placeholder'}. Set ${plural ? 'them' : 'it'} in the ` +
+        `selected environment, or remove ${plural ? 'them' : 'it'} from the request.`,
     );
   }
 

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useStore } from '../stores/appStore';
 import KeyValueEditor from './KeyValueEditor';
 import TransferControl from './TransferControl';
+import CodeDialog from './CodeDialog';
 import { METHODS, methodTone, type Auth, type BodyType, type Method } from '../types';
 
 const TABS = ['Params', 'Headers', 'Body', 'Auth', 'Assertions'] as const;
@@ -15,6 +16,7 @@ const input =
 export default function RequestEditor() {
   const { draft, dirty, running, updateDraft, saveDraft, send, project } = useStore();
   const [tab, setTab] = useState<Tab>('Params');
+  const [showCode, setShowCode] = useState(false);
 
   if (!draft) {
     return (
@@ -26,6 +28,8 @@ export default function RequestEditor() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      {showCode && <CodeDialog request={draft} onClose={() => setShowCode(false)} />}
+
       {/* Name + save */}
       <div className="flex items-center gap-2 border-b border-slate-800 px-3 py-2">
         <input
@@ -34,6 +38,14 @@ export default function RequestEditor() {
           className={`${input} flex-1 font-medium`}
           placeholder="Request name"
         />
+        <button
+          type="button"
+          onClick={() => setShowCode(true)}
+          disabled={!draft.url}
+          className="text-xs text-slate-500 hover:text-slate-200 disabled:opacity-40"
+        >
+          Code
+        </button>
         {draft.id && <TransferControl label="Move / copy…" requestIds={[draft.id]} />}
         {dirty && <span className="text-xs text-amber-400">unsaved</span>}
         <button
@@ -348,13 +360,17 @@ function AssertionsTab() {
 
   const update = (index: number, patch: Partial<(typeof rows)[number]>) => {
     const next = rows.map((row, i) => (i === index ? { ...row, ...patch } : row));
-    updateDraft({ assertions: next.filter((r) => r.expected || r.target) });
+    // Keep every row up to and including the one being edited. Filtering on "has a value"
+    // discarded the trailing blank row the moment its type or operator changed, so the
+    // dropdowns appeared frozen — they were resetting before anything could be typed.
+    updateDraft({ assertions: next.slice(0, Math.max(draft.assertions.length, index + 1)) });
   };
 
   return (
     <div className="flex flex-col gap-2">
       <p className="text-xs text-slate-500">
-        Checks run after every send. A failing check marks the run failed.
+        Checks run after every send; results appear under Checks in the response pane, and a failing
+        check marks the run failed. For example: status equals 200, or response time less than 500.
       </p>
       {rows.map((row, index) => (
         <div key={index} className="flex items-center gap-2">
@@ -392,11 +408,21 @@ function AssertionsTab() {
             <option value="exists">exists</option>
           </select>
 
-          {row.operator !== 'exists' && (
+          {row.operator === 'exists' ? (
+            <span className="flex-1 text-xs text-slate-600">no value needed</span>
+          ) : (
             <input
               value={row.expected}
               onChange={(e) => update(index, { expected: e.target.value })}
-              placeholder="200"
+              placeholder={
+                row.type === 'status'
+                  ? '200'
+                  : row.type === 'responseTime'
+                    ? '500'
+                    : row.type === 'header'
+                      ? 'application/json'
+                      : 'expected value'
+              }
               className={`${input} flex-1 font-mono`}
             />
           )}

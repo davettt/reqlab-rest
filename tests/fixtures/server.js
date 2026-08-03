@@ -70,6 +70,32 @@ export function createFixtureApp() {
     res.send(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
   });
 
+  // A documentation page that names its specification only in a loaded script — the shape
+  // Swagger UI actually produces, and the reason reading the HTML alone is not enough.
+  app.get('/docs', (_req, res) => {
+    res
+      .type('html')
+      .send(
+        '<!doctype html><html><head><title>API docs</title></head><body>' +
+          '<div id="swagger-ui"></div><script src="/swagger-initializer.js"></script>' +
+          '</body></html>',
+      );
+  });
+
+  app.get('/swagger-initializer.js', (_req, res) => {
+    res
+      .type('application/javascript')
+      .send('window.ui = SwaggerUIBundle({ url: "/spec/openapi.json", dom_id: "#swagger-ui" });');
+  });
+
+  app.get('/spec/openapi.json', (_req, res) => {
+    res.json({
+      openapi: '3.0.0',
+      info: { title: 'Fixture API', version: '1.0.0' },
+      paths: { '/echo': { get: { responses: { 200: { description: 'ok' } } } } },
+    });
+  });
+
   app.get('/xml', (_req, res) => {
     res.set('content-type', 'application/xml');
     res.send(
@@ -185,6 +211,11 @@ export function createFixtureApp() {
     res.json({ total: items.length, page, limit, data: items.slice(start, start + limit) });
   });
 
+  // BROKEN: returns an internal field the documentation does not describe.
+  app.get('/broken/document-extra', (_req, res) => {
+    res.json({ body: 'hello', internalOwnerEmail: 'ops@example.com' });
+  });
+
   app.get('/good/document', (_req, res) => {
     res.set('etag', '"v1"').set('cache-control', 'max-age=60').json({ body: 'hello' });
   });
@@ -256,6 +287,21 @@ export function createFixtureApp() {
   }
 
   app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
+
+  // A correct API answers malformed input with a generic 400. Without this, express.json()
+  // throws before any handler runs and Express's default error page returns an HTML stack
+  // trace — which would make every /good endpoint leak, and the correct twins would not be
+  // correct. The /broken/parse endpoint leaks deliberately, inside its own handler.
+  // eslint-disable-next-line no-unused-vars -- Express identifies error handlers by arity
+  app.use((err, _req, res, _next) => {
+    if (err?.type === 'entity.too.large') {
+      return res.status(413).json({ error: 'Payload too large' });
+    }
+    if (err instanceof SyntaxError || err?.type === 'entity.parse.failed') {
+      return res.status(400).json({ error: 'Invalid JSON' });
+    }
+    res.status(500).json({ error: 'Internal Server Error' });
+  });
 
   return app;
 }

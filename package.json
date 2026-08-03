@@ -1,7 +1,7 @@
 {
   "name": "reqlab-rest",
   "version": "0.1.0",
-  "description": "A light, local REST client with an API-verification lab — contract, security, behaviour and rate-limit testing with shareable reports.",
+  "description": "A light, local REST client with an API-verification lab \u2014 contract, security, behaviour and rate-limit testing with shareable reports.",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -33,9 +33,13 @@
     "test:unit": "node tests/unit.js",
     "test:exec": "node tests/exec.js",
     "test:api": "node tests/api.js",
+    "test:import": "node tests/import.js",
+    "test:codegen": "node tests/codegen.js",
+    "test:ai": "node tests/ai.js",
+    "test:verify": "node tests/verify.js",
     "test:smoke": "node tests/smoke.js",
     "test:integration": "node tests/harness.js integration",
-    "test": "npm run test:unit && npm run test:exec && npm run test:api && npm run test:smoke && npm run test:integration",
+    "test": "npm run test:unit && npm run test:exec && npm run test:import && npm run test:codegen && npm run test:ai && npm run test:verify && npm run test:api && npm run test:smoke && npm run test:integration",
     "prepare": "husky"
   },
   "dependencies": {
@@ -43,6 +47,7 @@
     "express": "^5.1.0",
     "express-rate-limit": "^8.2.1",
     "helmet": "^8.1.0",
+    "js-yaml": "^5.2.2",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "undici": "^7.16.0",

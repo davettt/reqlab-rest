@@ -1,5 +1,15 @@
 import { create } from 'zustand';
-import type { ApiRequest, Environment, Project, RunResult } from '../types';
+import type {
+  AiSettings,
+  ApiRequest,
+  Environment,
+  ImportFailure,
+  ImportPreview,
+  Project,
+  RunResult,
+  Variable,
+  VerifyRun,
+} from '../types';
 import { emptyRequest } from '../types';
 
 /* ---------------------------------------------------------------- *
@@ -26,6 +36,22 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
   return payload as T;
 }
 
+/** Keep the most recent responses only: a stored response can be megabytes. */
+const MAX_REMEMBERED = 10;
+
+function remember(
+  results: Record<string, RunResult>,
+  id: string,
+  result: RunResult,
+): Record<string, RunResult> {
+  const next = { ...results, [id]: result };
+  const keys = Object.keys(next);
+  if (keys.length <= MAX_REMEMBERED) return next;
+
+  // Drop the oldest insertion — object key order is insertion order for string keys.
+  return Object.fromEntries(Object.entries(next).slice(keys.length - MAX_REMEMBERED));
+}
+
 interface State {
   projects: Pick<Project, 'id' | 'name'>[];
   project: Project | null;
@@ -46,6 +72,11 @@ interface State {
   drafts: Record<string, ApiRequest>;
 
   result: RunResult | null;
+  /**
+   * The last response per request, so switching away and back shows what that request
+   * returned rather than an empty pane. Capped, because a response can be megabytes.
+   */
+  results: Record<string, RunResult>;
   running: boolean;
   error: string | null;
   loading: boolean;
@@ -54,6 +85,7 @@ interface State {
   createProject: (name: string) => Promise<void>;
   openProject: (id: string, options?: { keepDraft?: boolean }) => Promise<void>;
   deleteProject: (id: string) => Promise<void>;
+  renameProject: (id: string, name: string) => Promise<void>;
 
   selectRequest: (id: string) => void;
   newRequest: () => void;
@@ -64,6 +96,8 @@ interface State {
   setEnvironment: (id: string | null) => void;
   saveEnvironment: (env: Environment) => Promise<void>;
   createEnvironment: (name: string) => Promise<void>;
+  renameEnvironment: (id: string, name: string) => Promise<void>;
+  deleteEnvironment: (id: string) => Promise<void>;
 
   transfer: (args: {
     targetProjectId: string;
@@ -71,6 +105,40 @@ interface State {
     requestIds?: string[];
     environmentIds?: string[];
   }) => Promise<string | null>;
+
+  importPreview: (
+    input: ({ url: string } | { text: string }) & { useAi?: boolean },
+  ) => Promise<ImportPreview | ImportFailure>;
+  importApply: (args: {
+    projectId: string;
+    environmentId?: string | null;
+    environmentName: string;
+    requests: ApiRequest[];
+    variables: Variable[];
+  }) => Promise<string | null>;
+
+  settings: AiSettings | null;
+  runs: Pick<VerifyRun, 'id' | 'startedAt' | 'summary'>[];
+  loadRuns: (projectId: string) => Promise<void>;
+  runVerification: (args: {
+    projectId: string;
+    suites: string[];
+    environmentIds: string[];
+    spec?: unknown;
+    specText?: string;
+    specUrl?: string;
+    acknowledged: boolean;
+  }) => Promise<VerifyRun | { error: string }>;
+  loadSettings: () => Promise<void>;
+  saveSettings: (
+    patch: Partial<AiSettings> & { apiKeys?: Record<string, string> },
+  ) => Promise<void>;
+
+  generateCode: (
+    request: ApiRequest,
+    target: string,
+    inlineSecrets: boolean,
+  ) => Promise<{ code: string; notes: string[] } | null>;
 
   send: () => Promise<void>;
   clearError: () => void;
@@ -85,6 +153,9 @@ export const useStore = create<State>((set, get) => ({
   draft: null,
   dirty: false,
   drafts: {},
+  results: {},
+  settings: null,
+  runs: [],
   result: null,
   running: false,
   error: null,
@@ -138,6 +209,7 @@ export const useStore = create<State>((set, get) => ({
         dirty: keep ? previous.dirty : false,
         drafts: keep ? previous.drafts : {},
         result: keep ? previous.result : null,
+        results: keep ? previous.results : {},
         loading: false,
       });
     } catch (err) {
@@ -150,6 +222,20 @@ export const useStore = create<State>((set, get) => ({
       await call(`/projects/${id}`, { method: 'DELETE' });
       set({ project: null, requests: [], environments: [], draft: null, result: null });
       await get().loadProjects();
+    } catch (err) {
+      set({ error: (err as Error).message });
+    }
+  },
+
+  async renameProject(id, name) {
+    try {
+      await call<Project>(`/projects/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name }),
+      });
+      await get().loadProjects();
+      const project = get().project;
+      if (project?.id === id) set({ project: { ...project, name } });
     } catch (err) {
       set({ error: (err as Error).message });
     }
@@ -168,7 +254,9 @@ export const useStore = create<State>((set, get) => ({
       drafts: stashed,
       draft: { ...target },
       dirty: Boolean(stashed[id]),
-      result: null,
+      // Show what this request last returned. Clearing it meant a response was gone the
+      // moment you looked at anything else.
+      result: get().results[id] ?? null,
     });
   },
 
@@ -179,7 +267,7 @@ export const useStore = create<State>((set, get) => ({
       drafts: stashed,
       draft: { id: '', ...emptyRequest() } as ApiRequest,
       dirty: true,
-      result: null,
+      result: get().results[''] ?? null,
     });
   },
 
@@ -274,6 +362,38 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 
+  async renameEnvironment(id, name) {
+    const project = get().project;
+    if (!project) return;
+    try {
+      const saved = await call<Environment>(`/projects/${project.id}/environments/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name }),
+      });
+      set({ environments: get().environments.map((e) => (e.id === id ? saved : e)) });
+    } catch (err) {
+      set({ error: (err as Error).message });
+    }
+  },
+
+  async deleteEnvironment(id) {
+    const project = get().project;
+    if (!project) return;
+    try {
+      await call(`/projects/${project.id}/environments/${id}`, { method: 'DELETE' });
+      const remaining = get().environments.filter((e) => e.id !== id);
+      set({
+        environments: remaining,
+        // Fall back to another environment rather than none: leaving nothing selected makes
+        // every {{variable}} silently unresolved.
+        environmentId:
+          get().environmentId === id ? (remaining[0]?.id ?? null) : get().environmentId,
+      });
+    } catch (err) {
+      set({ error: (err as Error).message });
+    }
+  },
+
   async transfer(args) {
     const project = get().project;
     if (!project) return null;
@@ -299,6 +419,128 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 
+  async importPreview(input) {
+    try {
+      return await call<ImportPreview>('/import/preview', {
+        method: 'POST',
+        body: JSON.stringify(input),
+      });
+    } catch (err) {
+      // Reported inside the dialog rather than the global banner: it is part of the flow,
+      // and "that is not a spec" is guidance, not a failure of the app.
+      const message = (err as Error).message;
+      return {
+        error: message,
+        unstructured: message.includes('written documentation'),
+        needsKey: message.includes('API key is configured'),
+      };
+    }
+  },
+
+  async importApply(args) {
+    try {
+      const result = await call<{
+        requests: number;
+        environmentId: string | null;
+        addedVariables: string[];
+        keptVariables: string[];
+        secretsToFill: string[];
+      }>('/import/apply', {
+        method: 'POST',
+        body: JSON.stringify(args),
+      });
+      await get().openProject(args.projectId);
+
+      // Select the environment the import just created. openProject picks the first
+      // environment, which left an imported baseUrl unselected and every imported request
+      // failing with an unresolved {{baseUrl}}.
+      if (result.environmentId) set({ environmentId: result.environmentId });
+
+      const parts = [`Imported ${result.requests} request${result.requests === 1 ? '' : 's'}.`];
+      if (result.addedVariables.length) {
+        parts.push(`Added variables: ${result.addedVariables.join(', ')}.`);
+      }
+      if (result.keptVariables.length) {
+        parts.push(`Kept your existing values for: ${result.keptVariables.join(', ')}.`);
+      }
+      if (result.secretsToFill.length) {
+        parts.push(`Fill in the secret variables: ${result.secretsToFill.join(', ')}.`);
+      }
+      return parts.join(' ');
+    } catch (err) {
+      set({ error: (err as Error).message });
+      return null;
+    }
+  },
+
+  async loadRuns(projectId) {
+    try {
+      const { runs } = await call<{ runs: VerifyRun[] }>(`/verify/${projectId}/runs`);
+      set({ runs });
+    } catch {
+      // A missing run history is not worth an error banner: it just means none have run.
+      set({ runs: [] });
+    }
+  },
+
+  async runVerification(args) {
+    try {
+      const run = await call<VerifyRun>('/verify', {
+        method: 'POST',
+        body: JSON.stringify(args),
+      });
+      await get().loadRuns(args.projectId);
+      return run;
+    } catch (err) {
+      // Reported inside the Lab rather than the global banner: the refusal to test a host
+      // you have not vouched for is part of the flow, not a failure of the app.
+      return { error: (err as Error).message };
+    }
+  },
+
+  async loadSettings() {
+    try {
+      set({ settings: await call<AiSettings>('/settings') });
+    } catch (err) {
+      set({ error: (err as Error).message });
+    }
+  },
+
+  async saveSettings(patch) {
+    try {
+      const updated = await call<AiSettings>('/settings', {
+        method: 'PATCH',
+        body: JSON.stringify(patch),
+      });
+      set({ settings: updated });
+    } catch (err) {
+      set({ error: (err as Error).message });
+    }
+  },
+
+  async generateCode(request, target, inlineSecrets) {
+    const { project, environmentId } = get();
+    try {
+      // The id is not part of the codegen input; the rest of the request is.
+      const definition = { ...request, id: undefined };
+      delete definition.id;
+
+      return await call<{ code: string; notes: string[] }>('/codegen', {
+        method: 'POST',
+        body: JSON.stringify({
+          target,
+          request: definition,
+          projectId: project?.id,
+          environmentId,
+          inlineSecrets,
+        }),
+      });
+    } catch (err) {
+      set({ error: (err as Error).message });
+      return null;
+    }
+  },
+
   async send() {
     const { draft, project, environmentId } = get();
     if (!draft) return;
@@ -306,13 +548,13 @@ export const useStore = create<State>((set, get) => ({
     set({ running: true, error: null });
     try {
       // The draft is sent inline rather than by id, so unsaved edits are what actually run.
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars -- id is not part of the input
+      // The id is still needed, to file the response against the request it came from.
       const { id, ...request } = draft;
       const result = await call<RunResult>('/run', {
         method: 'POST',
         body: JSON.stringify({ projectId: project?.id, environmentId, request }),
       });
-      set({ result, running: false });
+      set({ result, running: false, results: remember(get().results, id, result) });
     } catch (err) {
       set({ error: (err as Error).message, running: false });
     }

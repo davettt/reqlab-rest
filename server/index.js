@@ -9,6 +9,10 @@ import { buildStale } from './buildCheck.js';
 import { installShutdownFlush } from './store.js';
 import { router as projectsRouter } from './routes/projects.js';
 import { router as runRouter } from './routes/run.js';
+import { router as importRouter } from './routes/import.js';
+import { router as codegenRouter } from './routes/codegen.js';
+import { router as settingsRouter } from './routes/settings.js';
+import { router as verifyRouter } from './routes/verify.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -91,6 +95,10 @@ app.get('/api/build-status', (_req, res) => {
 
 app.use('/api/projects', projectsRouter);
 app.use('/api/run', runRouter);
+app.use('/api/import', importRouter);
+app.use('/api/codegen', codegenRouter);
+app.use('/api/settings', settingsRouter);
+app.use('/api/verify', verifyRouter);
 
 // Must precede the SPA fallback: otherwise a typo'd or removed API route returns the HTML
 // shell with status 200 in production, and the client parses it as a successful response.
@@ -114,7 +122,12 @@ app.use((err, _req, res, _next) => {
     }));
     return res.status(400).json({ error: 'Invalid request', issues });
   }
-  if (err?.status && err.status < 500) {
+  if (
+    err?.name === 'ImportError' ||
+    err?.name === 'AiError' ||
+    err?.name === 'VerifyError' ||
+    (err?.status && err.status < 500)
+  ) {
     return res.status(err.status).json({ error: err.message });
   }
 

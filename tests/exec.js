@@ -292,6 +292,61 @@ try {
     assert(message.includes('did not respond'), `unexpected message: ${message}`);
   });
 
+  await test('an unresolved variable in the URL names the variable, not "invalid URL"', async () => {
+    let message = '';
+    try {
+      await run({ method: 'GET', url: '{{baseUrl}}/api/v2' });
+    } catch (err) {
+      message = err.message;
+    }
+    // The real cause is an empty or unselected environment; saying "not a valid URL" sends
+    // people hunting for a typo instead.
+    assert(message.includes('{{baseUrl}}'), `should name the variable, got: ${message}`);
+    assert(message.includes('environment'), 'and point at the environment');
+  });
+
+  await test('a URL holding an unresolved variable is refused, not sent literally', async () => {
+    let message = '';
+    try {
+      // This parses fine — braces percent-encode — so it used to be sent as a request for a
+      // path called %7B%7BpostId%7D%7D, and the API answered with a confusing 404.
+      await run({ method: 'GET', url: `${fixture.base}/posts/{{postId}}` });
+    } catch (err) {
+      message = err.message;
+    }
+    assert(message.includes('{{postId}}'), `should name the variable, got: ${message}`);
+    assert(message.includes('environment'), 'and say where to set it');
+  });
+
+  await test('an unresolved variable in a JSON body is refused too', async () => {
+    let message = '';
+    try {
+      // The imported POST /posts body is {"title":"{{title}}", ...}. Unset, the placeholders
+      // stayed literal, broke the JSON, and were sent — surfacing as a parse complaint from
+      // the API rather than "you have not set title".
+      await run({
+        method: 'POST',
+        url: `${fixture.base}/echo/body`,
+        body: { type: 'json', content: '{"title":"{{title}}","userId":{{userId}}}' },
+      });
+    } catch (err) {
+      message = err.message;
+    }
+    assert(message.includes('{{title}}'), `should name the variables, got: ${message}`);
+    assert(message.includes('{{userId}}'), 'both of them');
+  });
+
+  await test('deliberately malformed JSON is still sendable', async () => {
+    // Negative testing depends on this: broken input the user typed is a legitimate request,
+    // unlike a placeholder that was never filled in.
+    const r = await run({
+      method: 'POST',
+      url: `${fixture.base}/echo/body`,
+      body: { type: 'json', content: '{"broken": ' },
+    });
+    assert(r.response.status >= 400, 'the server answered, so it was sent');
+  });
+
   await test('a non-http scheme is refused before anything is sent', async () => {
     let message = '';
     try {

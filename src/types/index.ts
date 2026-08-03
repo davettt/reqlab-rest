@@ -11,6 +11,9 @@ export interface KeyValue {
   key: string;
   value: string;
   enabled: boolean;
+  /** Documented accepted values — rendered as a dropdown rather than a free-text box. */
+  options?: string[];
+  description?: string;
 }
 
 export interface Variable extends KeyValue {
@@ -140,6 +143,61 @@ export interface RunResult {
   /** Present instead of the above when the request could not be sent at all. */
   failed?: boolean;
   error?: string;
+}
+
+export interface ImportPreview {
+  source: string;
+  info: { title: string; version: string; format: string; description?: string };
+  warnings: string[];
+  redirects: string[];
+  variables: Variable[];
+  requests: ApiRequest[];
+  summary: { requests: number; variables: number; secrets: number };
+}
+
+export interface ImportFailure {
+  error: string;
+  unstructured?: boolean;
+  needsKey?: boolean;
+}
+
+export interface VerifyFinding {
+  suite: string;
+  severity: 'blocker' | 'major' | 'minor' | 'info';
+  title: string;
+  whatHappened: string;
+  whyItMatters: string;
+  expected: unknown;
+  actual: unknown;
+  endpoint: string | null;
+}
+
+export interface VerifySummary {
+  total: number;
+  blocker: number;
+  major: number;
+  minor: number;
+  info: number;
+  passed: boolean;
+}
+
+export interface VerifyRun {
+  id: string;
+  target: string;
+  startedAt: number;
+  finishedAt: number;
+  suites: string[];
+  skipped: { suite: string; reason: string }[];
+  findings: VerifyFinding[];
+  summary: VerifySummary;
+}
+
+export interface AiSettings {
+  provider: 'anthropic' | 'openai';
+  tier: 'fast' | 'smart';
+  configured: { anthropic: boolean; openai: boolean };
+  models: Record<'anthropic' | 'openai', { fast: string; smart: string }>;
+  providers: string[];
 }
 
 export function emptyRequest(): Omit<ApiRequest, 'id'> {
