@@ -403,6 +403,117 @@ try {
     );
     assertEqual(safe.request.headers.authorization, 'Bearer ••••', 'auth header masked by name');
   });
+  /* ---------------------------------------------------------------- *
+   * Credentials that cannot be put on the wire
+   * ---------------------------------------------------------------- */
+
+  await test('a homoglyph in an API key is explained, without showing the key', async () => {
+    // The reported case: a Cyrillic Te (U+0422) pasted in place of a Latin T. The platform's own
+    // error is "Cannot convert argument to a ByteString because the character at index 14 has a
+    // value of 1058", which is unreadable and quotes part of a credential back to the browser.
+    const request = {
+      name: 'homoglyph',
+      method: 'GET',
+      url: `${fixture.base}/echo`,
+      params: [],
+      headers: [],
+      body: { type: 'none' },
+      auth: { type: 'apiKey', in: 'header', key: 'X-API-Key', value: 'abcdefghijklmn\u0422opqr' },
+    };
+
+    const run = await executeRequest(request, { scope: buildScope({}) }).catch((err) => err);
+
+    assert(run instanceof Error, 'the send fails rather than going out mangled');
+    assert(run.message.includes('API key'), `should name the field: ${run.message}`);
+    assert(
+      run.message.includes('Cyrillic'),
+      'and identify the script, which is what makes it findable',
+    );
+    assert(run.message.includes('position 15'), 'and say where');
+
+    // The point of the rewrite: the credential does not appear in the message.
+    assert(!run.message.includes('abcdefghijklmn'), 'the key is not echoed');
+    assert(!run.message.includes('1058'), 'nor a character code from it');
+    assert(!run.message.includes('ByteString'), 'and the platform wording is gone');
+  });
+
+  await test('a newline pasted into a bearer token is named for what it is', async () => {
+    const request = {
+      name: 'newline',
+      method: 'GET',
+      url: `${fixture.base}/echo`,
+      params: [],
+      headers: [],
+      body: { type: 'none' },
+      auth: { type: 'bearer', token: 'tok\nen' },
+    };
+
+    const err = await executeRequest(request, { scope: buildScope({}) }).catch((e) => e);
+    // "a line break" rather than "a control character": the reader has to recognise it in
+    // something they pasted, and the category name does not help them do that.
+    assert(err.message.includes('line break'), `unexpected: ${err.message}`);
+    assert(err.message.includes('bearer token'), 'names the field');
+  });
+
+  await test('every unsendable character is reported, not just the first', async () => {
+    // Taken from a real clipboard: two adjacent Cyrillic letters and a trailing line break.
+    // A word processor that substituted one lookalike usually substituted its neighbours too,
+    // and reporting them one send at a time turns one paste mistake into a guessing game.
+    const request = {
+      name: 'several',
+      method: 'GET',
+      url: `${fixture.base}/echo`,
+      params: [],
+      headers: [],
+      body: { type: 'none' },
+      auth: {
+        type: 'apiKey',
+        in: 'header',
+        key: 'X-API-Key',
+        value: 'abcdefghijklmnТХpqrstuv\nmore',
+      },
+    };
+
+    const err = await executeRequest(request, { scope: buildScope({}) }).catch((e) => e);
+
+    assert(err.message.includes('3 characters'), `should count them: ${err.message}`);
+    assert(err.message.includes('position 15'), 'the first');
+    assert(err.message.includes('position 16'), 'the second, adjacent to it');
+    assert(err.message.includes('line break'), 'and the line break');
+    assert(!err.message.includes('abcdefghijklmn'), 'still without echoing the credential');
+  });
+
+  await test('a normal credential is unaffected', async () => {
+    const request = {
+      name: 'clean',
+      method: 'GET',
+      url: `${fixture.base}/auth/bearer`,
+      params: [],
+      headers: [],
+      body: { type: 'none' },
+      auth: { type: 'bearer', token: 'valid-token' },
+    };
+
+    const run = await executeRequest(request, { scope: buildScope({}) });
+    assertEqual(run.response.status, 200, 'the check does not reject a good token');
+  });
+
+  await test('a non-ASCII API key in the query string is still allowed', async () => {
+    // Query values are percent-encoded, so they survive characters a header cannot carry.
+    // Rejecting them would refuse a request the transport handles perfectly well.
+    const request = {
+      name: 'query key',
+      method: 'GET',
+      url: `${fixture.base}/echo`,
+      params: [],
+      headers: [],
+      body: { type: 'none' },
+      auth: { type: 'apiKey', in: 'query', key: 'api_key', value: '\u0422odd' },
+    };
+
+    const run = await executeRequest(request, { scope: buildScope({}) });
+    assertEqual(run.response.status, 200, 'sent without complaint');
+  });
 } finally {
   await fixture.stop();
   await other.stop();

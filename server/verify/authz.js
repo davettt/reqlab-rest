@@ -202,6 +202,31 @@ function checkHygiene({ findings, request, run }) {
     );
   }
 
+  // A framework banner is not a vulnerability on its own; it is free reconnaissance. It tells
+  // anyone probing which stack to look up known issues for, and it is one line to remove.
+  const banners = ['x-powered-by', 'x-aspnet-version', 'x-aspnetmvc-version'].filter(
+    (h) => headers[h],
+  );
+  if (banners.length) {
+    findings.push(
+      finding({
+        suite: SUITE,
+        severity: 'minor',
+        endpoint: label(request),
+        title: `${label(request)} advertises the software it runs on`,
+        whatHappened: `The response carries ${banners.map((h) => `${h}: ${headers[h]}`).join(', ')}.`,
+        whyItMatters:
+          'This tells anyone probing the API which stack to look up known vulnerabilities ' +
+          'for, and narrows their search from "some API" to a specific framework and often a ' +
+          'specific version. It grants no access by itself, and removing it is usually one ' +
+          'line of configuration.',
+        expected: 'no framework banner',
+        actual: banners.join(', '),
+        evidence: evidenceFrom(run),
+      }),
+    );
+  }
+
   const missing = ['x-content-type-options', 'x-frame-options'].filter((h) => !headers[h]);
   if (missing.length === 2) {
     findings.push(

@@ -7,10 +7,16 @@ import type {
   ImportPreview,
   Project,
   RunResult,
+  Scenario,
+  ScenarioRun,
+  ScenarioStep,
   Variable,
   VerifyRun,
 } from '../types';
 import { emptyRequest } from '../types';
+
+/** What the scenario endpoints accept — the stored shape without its server-assigned fields. */
+type ScenarioInput = { name: string; description?: string; steps: ScenarioStep[] };
 
 /* ---------------------------------------------------------------- *
  * API client
@@ -77,6 +83,12 @@ interface State {
    * returned rather than an empty pane. Capped, because a response can be megabytes.
    */
   results: Record<string, RunResult>;
+  /**
+   * The response each request returned *before* its latest one, which is what the Diff tab
+   * compares against. Kept separately because `results` is overwritten on every send.
+   */
+  previous: RunResult | null;
+  previousResults: Record<string, RunResult>;
   running: boolean;
   error: string | null;
   loading: boolean;
@@ -129,6 +141,17 @@ interface State {
     specUrl?: string;
     acknowledged: boolean;
   }) => Promise<VerifyRun | { error: string }>;
+  saveLatencyBaseline: (projectId: string, runId: string) => Promise<boolean>;
+  scenarios: Scenario[];
+  loadScenarios: (projectId: string) => Promise<void>;
+  createScenario: (projectId: string, input: ScenarioInput) => Promise<Scenario | null>;
+  updateScenario: (projectId: string, id: string, input: ScenarioInput) => Promise<Scenario | null>;
+  deleteScenario: (projectId: string, id: string) => Promise<void>;
+  runScenario: (
+    projectId: string,
+    id: string,
+    environmentId?: string,
+  ) => Promise<ScenarioRun | { error: string }>;
   loadSettings: () => Promise<void>;
   saveSettings: (
     patch: Partial<AiSettings> & { apiKeys?: Record<string, string> },
@@ -154,9 +177,11 @@ export const useStore = create<State>((set, get) => ({
   dirty: false,
   drafts: {},
   results: {},
+  previousResults: {},
   settings: null,
   runs: [],
   result: null,
+  previous: null,
   running: false,
   error: null,
   loading: false,
@@ -209,6 +234,7 @@ export const useStore = create<State>((set, get) => ({
         dirty: keep ? previous.dirty : false,
         drafts: keep ? previous.drafts : {},
         result: keep ? previous.result : null,
+        previous: keep ? previous.previous : null,
         results: keep ? previous.results : {},
         loading: false,
       });
@@ -257,6 +283,7 @@ export const useStore = create<State>((set, get) => ({
       // Show what this request last returned. Clearing it meant a response was gone the
       // moment you looked at anything else.
       result: get().results[id] ?? null,
+      previous: get().previousResults[id] ?? null,
     });
   },
 
@@ -268,6 +295,7 @@ export const useStore = create<State>((set, get) => ({
       draft: { id: '', ...emptyRequest() } as ApiRequest,
       dirty: true,
       result: get().results[''] ?? null,
+      previous: get().previousResults[''] ?? null,
     });
   },
 
@@ -498,6 +526,81 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 
+  async saveLatencyBaseline(projectId, runId) {
+    try {
+      await call(`/verify/${projectId}/baseline`, {
+        method: 'POST',
+        body: JSON.stringify({ runId }),
+      });
+      return true;
+    } catch (err) {
+      set({ error: (err as Error).message });
+      return false;
+    }
+  },
+
+  scenarios: [],
+
+  async loadScenarios(projectId) {
+    try {
+      const { scenarios } = await call<{ scenarios: Scenario[] }>(`/scenarios/${projectId}`);
+      set({ scenarios });
+    } catch {
+      // As with run history: none stored is the normal state, not an error worth a banner.
+      set({ scenarios: [] });
+    }
+  },
+
+  async createScenario(projectId, input) {
+    try {
+      const scenario = await call<Scenario>(`/scenarios/${projectId}`, {
+        method: 'POST',
+        body: JSON.stringify(input),
+      });
+      await get().loadScenarios(projectId);
+      return scenario;
+    } catch (err) {
+      set({ error: (err as Error).message });
+      return null;
+    }
+  },
+
+  async updateScenario(projectId, id, input) {
+    try {
+      const scenario = await call<Scenario>(`/scenarios/${projectId}/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify(input),
+      });
+      await get().loadScenarios(projectId);
+      return scenario;
+    } catch (err) {
+      set({ error: (err as Error).message });
+      return null;
+    }
+  },
+
+  async deleteScenario(projectId, id) {
+    try {
+      await call(`/scenarios/${projectId}/${id}`, { method: 'DELETE' });
+      await get().loadScenarios(projectId);
+    } catch (err) {
+      set({ error: (err as Error).message });
+    }
+  },
+
+  async runScenario(projectId, id, environmentId) {
+    try {
+      return await call<ScenarioRun>(`/scenarios/${projectId}/${id}/run`, {
+        method: 'POST',
+        body: JSON.stringify(environmentId ? { environmentId } : {}),
+      });
+    } catch (err) {
+      // Shown next to the scenario rather than in the global banner, the same way the Lab
+      // reports a refusal: it is part of the flow.
+      return { error: (err as Error).message };
+    }
+  },
+
   async loadSettings() {
     try {
       set({ settings: await call<AiSettings>('/settings') });
@@ -554,7 +657,20 @@ export const useStore = create<State>((set, get) => ({
         method: 'POST',
         body: JSON.stringify({ projectId: project?.id, environmentId, request }),
       });
-      set({ result, running: false, results: remember(get().results, id, result) });
+
+      // The response being replaced becomes the one the Diff tab compares against. Captured
+      // here rather than derived later, because `results` only ever holds the latest.
+      const superseded = get().results[id];
+
+      set({
+        result,
+        previous: superseded ?? null,
+        running: false,
+        results: remember(get().results, id, result),
+        previousResults: superseded
+          ? remember(get().previousResults, id, superseded)
+          : get().previousResults,
+      });
     } catch (err) {
       set({ error: (err as Error).message, running: false });
     }

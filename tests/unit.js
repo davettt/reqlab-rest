@@ -388,5 +388,133 @@ await test('bodies: textual content types are detected', () => {
   assertEqual(bodies.isTextualContentType(null), true, 'undeclared is assumed textual');
 });
 
+/* ---------------------------------------------------------------- *
+ * Secret handling — renaming must not destroy a stored secret
+ * ---------------------------------------------------------------- */
+
+const model = await import('../server/model.js');
+
+await test('model: renaming a secret keeps its stored value', () => {
+  const stored = model.encryptSecrets(
+    [{ key: 'token', value: 'real-secret', secret: true, enabled: true }],
+    [],
+  );
+  assert(stored[0].id, 'the server assigned an id');
+  assert(stored[0].value.startsWith('enc:'), 'and encrypted the value');
+
+  // What the UI sends back after a rename: same id, new key, value still the mask.
+  const renamed = model.encryptSecrets(
+    [{ ...stored[0], key: 'apiToken', value: vars.MASK }],
+    stored,
+  );
+
+  assertEqual(renamed[0].key, 'apiToken', 'the rename applied');
+  assertEqual(renamed[0].value, stored[0].value, 'and the stored secret survived it');
+});
+
+await test('model: a rename and a reorder in the same save both survive', () => {
+  const stored = model.encryptSecrets(
+    [
+      { key: 'a', value: 'secret-a', secret: true, enabled: true },
+      { key: 'b', value: 'secret-b', secret: true, enabled: true },
+    ],
+    [],
+  );
+
+  // Reversed order and both renamed — matching on key alone could not survive this.
+  const saved = model.encryptSecrets(
+    [
+      { ...stored[1], key: 'bee', value: vars.MASK },
+      { ...stored[0], key: 'ay', value: vars.MASK },
+    ],
+    stored,
+  );
+
+  assertEqual(saved[0].value, stored[1].value, 'b kept its own secret under its new name');
+  assertEqual(saved[1].value, stored[0].value, 'a kept its own secret under its new name');
+});
+
+await test('model: an unmatched mask is refused rather than silently wiped', () => {
+  // A client that renames without sending the id has nothing to match. Storing an empty value
+  // here would destroy a credential the user cannot read back — so it must fail loudly.
+  let message = '';
+  try {
+    model.encryptSecrets(
+      [{ key: 'renamed', value: vars.MASK, secret: true }],
+      [{ key: 'original', value: 'enc:whatever', secret: true }],
+    );
+  } catch (err) {
+    message = err.message;
+  }
+  assert(message.includes('renamed'), `should name the variable, got: ${message}`);
+  assert(message.includes('Re-enter'), 'and say what to do about it');
+});
+
+await test('model: a genuinely new empty secret is still allowed', () => {
+  // Empty is not the mask: it means "I have not filled this in yet", which is normal.
+  const saved = model.encryptSecrets([{ key: 'later', value: '', secret: true }], []);
+  assertEqual(saved[0].value, '', 'stored empty');
+  assert(saved[0].id, 'and still got an id');
+});
+
+await test('model: the v1 migration backfills variable ids without touching values', () => {
+  const v1 = {
+    schemaVersion: 1,
+    variables: [{ key: 'token', value: 'enc:abc', secret: true, enabled: true }],
+  };
+  const migrated = model.projectMigrations[1](v1);
+
+  assertEqual(migrated.schemaVersion, 2, 'version bumped');
+  assert(migrated.variables[0].id, 'id assigned');
+  assertEqual(migrated.variables[0].value, 'enc:abc', 'the encrypted value is untouched');
+
+  const envs = model.environmentsMigrations[1]({
+    schemaVersion: 1,
+    environments: [{ id: 'e1', name: 'local', variables: [{ key: 'k', value: 'v' }] }],
+  });
+  assert(envs.environments[0].variables[0].id, 'environment variables get ids too');
+});
+
+/* ---------------------------------------------------------------- *
+ * Dynamic variables
+ * ---------------------------------------------------------------- */
+
+await test('vars: {{$uuid}} is one value per send, not per occurrence', () => {
+  // Two occurrences in one request must agree, or a body that correlates with a header is
+  // broken and the recorded run shows a value that was never sent.
+  const scope = vars.buildScope({});
+  const resolved = vars.interpolate('a={{$uuid}} b={{$uuid}}', scope).text;
+  const [a, b] = resolved.replace('a=', '').split(' b=');
+
+  assertEqual(a, b, 'the same within one scope');
+  assert(/^[0-9a-f-]{36}$/.test(a), `should look like a uuid, got ${a}`);
+});
+
+await test('vars: a new send gets a new value', () => {
+  const first = vars.interpolate('{{$uuid}}', vars.buildScope({})).text;
+  const second = vars.interpolate('{{$uuid}}', vars.buildScope({})).text;
+  assert(first !== second, 'a fresh scope generates afresh');
+});
+
+await test('vars: a variable of the same name pins a dynamic value', () => {
+  // This is how the retry path is tested: an idempotency key only means something if you can
+  // also send the same one twice deliberately.
+  const scope = vars.buildScope({ envVars: [{ key: '$uuid', value: 'PINNED', enabled: true }] });
+  assertEqual(vars.interpolate('{{$uuid}}', scope).text, 'PINNED', 'the variable wins');
+});
+
+await test('vars: the other generated values resolve to their expected shapes', () => {
+  const scope = vars.buildScope({});
+  assert(/^\d{10}$/.test(vars.interpolate('{{$timestamp}}', scope).text), 'unix seconds');
+  assert(/^\d{4}-\d{2}-\d{2}T/.test(vars.interpolate('{{$isoTimestamp}}', scope).text), 'iso 8601');
+  assert(/^\d+$/.test(vars.interpolate('{{$randomInt}}', scope).text), 'an integer');
+});
+
+await test('vars: an unknown $name is still reported missing rather than invented', () => {
+  const result = vars.interpolate('{{$nope}}', vars.buildScope({}));
+  assertEqual(result.missing.join(','), '$nope', 'reported, not silently blanked');
+  assertEqual(result.text, '{{$nope}}', 'and left alone');
+});
+
 await fs.rm(SCRATCH, { recursive: true, force: true });
 summarise('unit');

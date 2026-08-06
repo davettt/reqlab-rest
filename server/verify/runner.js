@@ -13,22 +13,40 @@
 import { runContract } from './contract.js';
 import { runNegative } from './negative.js';
 import { runAuthz } from './authz.js';
+import { runPagination } from './pagination.js';
+import { runIdempotency } from './idempotency.js';
+import { runCaching } from './caching.js';
+import { runLatency } from './latency.js';
 import { sortFindings, summarise } from './findings.js';
 import { executeRequest, sanitiseRun } from '../exec/run.js';
 import { buildScope } from '../vars.js';
 
-export const SUITES = ['contract', 'negative', 'authz'];
+export const SUITES = [
+  'contract',
+  'negative',
+  'authz',
+  'pagination',
+  'idempotency',
+  'caching',
+  'latency',
+];
 
 /**
  * Suites that do something a normal caller would not.
  *
- * Contract conformance is deliberately absent: it sends the documented requests and compares
- * the responses, which is what any consumer of the API does anyway. Checking whether a
- * third-party API matches its own published documentation is a legitimate thing to do without
- * owning it. Negative testing and the authorisation probes are different — malformed bodies,
- * oversized payloads, and requests with credentials removed or swapped.
+ * Contract, pagination and caching are deliberately absent: they send the documented requests,
+ * walk pages, and re-request with a conditional header — all things any consumer of the API
+ * does anyway. Checking whether a third-party API matches its own published documentation is a
+ * legitimate thing to do without owning it.
+ *
+ * Latency is absent for the same reason, having been built to only ever repeat safe methods.
+ *
+ * The rest are different in kind. Negative testing sends malformed and oversized bodies, the
+ * authorisation probes replay requests with credentials removed or swapped, and idempotency
+ * repeats writes — a second PUT, a second DELETE, a second create. Repeating a write against
+ * someone else's system changes their data, so it needs the acknowledgement.
  */
-const INTRUSIVE_SUITES = ['negative', 'authz'];
+const INTRUSIVE_SUITES = ['negative', 'authz', 'idempotency'];
 
 export class VerifyError extends Error {
   constructor(message) {
@@ -46,6 +64,7 @@ export class VerifyError extends Error {
  * @param {object[]} args.identities  [{ name, variables }] — two enable cross-user checks
  * @param {object[]} args.projectVars project-level variables
  * @param {boolean} args.acknowledged the caller owns or is authorised to test the target
+ * @param {object} [args.latencyBaseline] previously saved timings to diff this run against
  */
 export async function runVerification({
   requests,
@@ -54,6 +73,7 @@ export async function runVerification({
   identities = [],
   projectVars = [],
   acknowledged = false,
+  latencyBaseline = null,
 }) {
   if (!requests?.length) throw new VerifyError('There are no requests to verify.');
 
@@ -70,6 +90,21 @@ export async function runVerification({
   const send = async (request) => {
     const scope = scopeFor(primary);
     return sanitiseRun(await executeRequest(request, { scope }), scope);
+  };
+
+  /**
+   * A sender whose variable scope is fixed for its lifetime.
+   *
+   * The idempotency suite sends the same request twice and compares the results, which only
+   * means anything if the two sends are genuinely identical. Generated variables — {{$uuid}}
+   * above all — resolve afresh on every scope build, so the default `send` would give the
+   * repeat a different Idempotency-Key. The suite would then see two creates and report that
+   * the key was ignored, against an API handling it correctly. A retry reuses its resolved
+   * values by definition; this is what makes the repeat a retry rather than a new request.
+   */
+  const session = () => {
+    const scope = scopeFor(primary);
+    return async (request) => sanitiseRun(await executeRequest(request, { scope }), scope);
   };
 
   /**
@@ -124,6 +159,34 @@ export async function runVerification({
     ran.push('authz');
   }
 
+  if (suites.includes('pagination')) {
+    findings.push(...(await runPagination({ send, requests })));
+    ran.push('pagination');
+  }
+
+  if (suites.includes('idempotency')) {
+    findings.push(...(await runIdempotency({ send, session, requests })));
+    ran.push('idempotency');
+  }
+
+  if (suites.includes('caching')) {
+    findings.push(...(await runCaching({ send, requests })));
+    ran.push('caching');
+  }
+
+  // Latency is the one suite that produces something besides findings: the timings themselves,
+  // which the caller stores so the next run has something to diff against.
+  let latency = null;
+  if (suites.includes('latency')) {
+    const result = await runLatency({ send, requests, baseline: latencyBaseline });
+    findings.push(...result.findings);
+    latency = {
+      measurements: result.measurements,
+      comparedAgainst: latencyBaseline?.savedAt ?? null,
+    };
+    ran.push('latency');
+  }
+
   const sorted = sortFindings(findings);
 
   return {
@@ -131,6 +194,7 @@ export async function runVerification({
     finishedAt: Date.now(),
     suites: ran,
     skipped,
+    latency,
     findings: sorted,
     summary: summarise(sorted),
   };

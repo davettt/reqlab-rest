@@ -7,6 +7,7 @@
  */
 import { test, assert, assertEqual, summarise } from './util.js';
 import { parseDocument, looksUnstructured, ImportError } from '../server/import/index.js';
+import { parseOpenApi } from '../server/import/openapi.js';
 
 console.log('import: reqlab-rest');
 
@@ -441,6 +442,387 @@ await test('empty input is refused', () => {
     threw = true;
   }
   assert(threw, 'should refuse');
+});
+
+/* ---------------------------------------------------------------- *
+ * Things a real-world spec exposed
+ * ---------------------------------------------------------------- */
+
+await test('openapi: an operation with two success statuses asserts any 2xx', () => {
+  // A create that documents 201 plus a 200 idempotent replay is common. Asserting the first
+  // key found produced "expects 200", which fails on every genuine first call — a correct API
+  // reported as broken by the tool meant to check it.
+  const spec = {
+    openapi: '3.1.0',
+    info: { title: 'Two successes', version: '1' },
+    servers: [{ url: 'https://api.example.com' }],
+    paths: {
+      '/things': {
+        post: {
+          summary: 'Create a thing',
+          responses: {
+            200: { description: 'Idempotent replay' },
+            201: { description: 'Created' },
+            400: { description: 'Bad request' },
+          },
+        },
+      },
+    },
+  };
+
+  const result = parseOpenApi(spec);
+  const status = result.requests[0].assertions.find((a) => a.type === 'status');
+
+  assertEqual(status.operator, 'lessThan', 'asserts a range, not one code');
+  assertEqual(status.expected, '300', 'any 2xx');
+  assert(
+    result.warnings.some((w) => w.includes('200, 201')),
+    `should name both codes, got: ${result.warnings.join(' | ')}`,
+  );
+});
+
+await test('openapi: a single success status is still asserted exactly', () => {
+  const spec = {
+    openapi: '3.0.0',
+    info: { title: 'One success', version: '1' },
+    servers: [{ url: 'https://api.example.com' }],
+    paths: { '/things': { post: { responses: { 201: { description: 'Created' } } } } },
+  };
+
+  const status = parseOpenApi(spec).requests[0].assertions.find((a) => a.type === 'status');
+  assertEqual(status.operator, 'equals', 'exact when there is no ambiguity');
+  assertEqual(status.expected, '201', 'the documented code');
+});
+
+await test('openapi: multiple servers are reported rather than silently picking one', () => {
+  // The danger is a spec that happens to list production first: an import would point a
+  // testing tool at live data without ever saying so.
+  const spec = {
+    openapi: '3.1.0',
+    info: { title: 'Many servers', version: '1' },
+    servers: [
+      { url: 'https://qa.example.com', description: 'QA' },
+      { url: 'https://api.example.com', description: 'Production' },
+    ],
+    paths: { '/things': { get: { responses: { 200: { description: 'ok' } } } } },
+  };
+
+  const result = parseOpenApi(spec);
+  const baseUrl = result.variables.find((v) => v.key === 'baseUrl');
+
+  assertEqual(baseUrl.value, 'https://qa.example.com', 'the first is used');
+  const warning = result.warnings.find((w) => w.includes('4 servers') || w.includes('2 servers'));
+  assert(warning, `should warn, got: ${result.warnings.join(' | ')}`);
+  assert(warning.includes('Production'), 'and name the alternatives it did not choose');
+});
+
+await test('openapi: an imported Idempotency-Key is flagged as single-use', () => {
+  const spec = {
+    openapi: '3.1.0',
+    info: { title: 'Idempotent', version: '1' },
+    servers: [{ url: 'https://api.example.com' }],
+    paths: {
+      '/things': {
+        post: {
+          parameters: [
+            {
+              name: 'Idempotency-Key',
+              in: 'header',
+              required: true,
+              schema: { type: 'string', example: 'key-123' },
+            },
+          ],
+          responses: { 201: { description: 'Created' } },
+        },
+      },
+    },
+  };
+
+  const result = parseOpenApi(spec);
+  assert(
+    result.warnings.some((w) => w.includes('Idempotency-Key') && w.includes('retry')),
+    `should explain the replay behaviour, got: ${result.warnings.join(' | ')}`,
+  );
+});
+
+await test('openapi: a schema permitting no array entries samples as empty', () => {
+  // A reserved field with maxItems: 0 is documented as rejected when non-empty. Generating an
+  // entry produced exactly the payload the API says is invalid.
+  const spec = {
+    openapi: '3.1.0',
+    info: { title: 'Reserved', version: '1' },
+    servers: [{ url: 'https://api.example.com' }],
+    paths: {
+      '/things': {
+        post: {
+          requestBody: {
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    reserved: {
+                      type: 'array',
+                      maxItems: 0,
+                      items: { type: 'object', properties: { a: { type: 'string' } } },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 201: { description: 'Created' } },
+        },
+      },
+    },
+  };
+
+  const body = JSON.parse(parseOpenApi(spec).requests[0].body.content);
+  assertEqual(body.reserved.length, 0, `should be empty, got ${JSON.stringify(body.reserved)}`);
+});
+
+await test('openapi: minItems is honoured when a schema insists on entries', () => {
+  const spec = {
+    openapi: '3.1.0',
+    info: { title: 'AtLeastTwo', version: '1' },
+    servers: [{ url: 'https://api.example.com' }],
+    paths: {
+      '/things': {
+        post: {
+          requestBody: {
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: { tags: { type: 'array', minItems: 2, items: { type: 'string' } } },
+                },
+              },
+            },
+          },
+          responses: { 201: { description: 'Created' } },
+        },
+      },
+    },
+  };
+
+  const body = JSON.parse(parseOpenApi(spec).requests[0].body.content);
+  assertEqual(body.tags.length, 2, 'two entries');
+});
+
+await test('openapi: a required field missing from the example is filled in and reported', () => {
+  // A spec's example can drift from the schema beside it. Importing it verbatim produced a
+  // body rejected on the first send, which reads as a fault in this tool.
+  const spec = {
+    openapi: '3.1.0',
+    info: { title: 'Drifted', version: '1' },
+    servers: [{ url: 'https://api.example.com' }],
+    paths: {
+      '/things': {
+        post: {
+          requestBody: {
+            content: {
+              'application/json': {
+                example: { name: 'given' },
+                schema: {
+                  type: 'object',
+                  required: ['name', 'kind'],
+                  properties: {
+                    name: { type: 'string' },
+                    kind: { type: 'string', example: 'widget' },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 201: { description: 'Created' } },
+        },
+      },
+    },
+  };
+
+  const result = parseOpenApi(spec);
+  const body = JSON.parse(result.requests[0].body.content);
+
+  assertEqual(body.name, 'given', "the example's own value is never replaced");
+  assertEqual(body.kind, 'widget', 'the missing required field was filled from the schema');
+  assert(
+    result.warnings.some((w) => w.includes('omits required') && w.includes('kind')),
+    `should name the omitted field, got: ${result.warnings.join(' | ')}`,
+  );
+});
+
+await test('openapi: required fields are reported, conditional ones separately', () => {
+  // The distinction is the point: `plant` is not required by the request, it is required once
+  // you choose to send a `plants` entry. A flat list saying "plant is required" misleads.
+  const spec = {
+    openapi: '3.1.0',
+    info: { title: 'Nested', version: '1' },
+    servers: [{ url: 'https://api.example.com' }],
+    paths: {
+      '/things': {
+        post: {
+          requestBody: {
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['reference', 'material'],
+                  properties: {
+                    reference: { type: 'string' },
+                    material: {
+                      type: 'object',
+                      required: ['partNumber'],
+                      properties: { partNumber: { type: 'string' } },
+                    },
+                    plants: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        required: ['plant'],
+                        properties: { plant: { type: 'string' } },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 201: { description: 'Created' } },
+        },
+      },
+    },
+  };
+
+  const { warnings } = parseOpenApi(spec);
+
+  const unconditional = warnings.find((w) => w.includes('requires reference'));
+  assert(unconditional, `expected an unconditional list, got: ${warnings.join(' | ')}`);
+  assert(unconditional.includes('material.partNumber'), 'reaches into a required object');
+  assert(!unconditional.includes('plants'), 'and does not claim an optional array is required');
+
+  const conditional = warnings.find((w) => w.includes('if you include plants[]'));
+  assert(conditional, 'the array entry requirement is reported as conditional');
+  assert(conditional.includes('plant'), 'and names the field');
+});
+
+await test('openapi: 3.1 const is sampled as its only permitted value', () => {
+  const spec = {
+    openapi: '3.1.0',
+    info: { title: 'Const', version: '1' },
+    servers: [{ url: 'https://api.example.com' }],
+    paths: {
+      '/things': {
+        post: {
+          requestBody: {
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: { status: { const: 'draft', type: 'string' } },
+                },
+              },
+            },
+          },
+          responses: { 201: { description: 'Created' } },
+        },
+      },
+    },
+  };
+
+  const body = JSON.parse(parseOpenApi(spec).requests[0].body.content);
+  assertEqual(body.status, 'draft', 'not the generic "string" placeholder');
+});
+
+await test('openapi: the body holds required fields only, keeping the example values', () => {
+  // A spec's example demonstrates the endpoint's full range, which is the opposite of what a
+  // request you are about to send wants: every optional field arrives holding an illustrative
+  // business code the API then tries to resolve and rejects.
+  const spec = {
+    openapi: '3.1.0',
+    info: { title: 'Minimal', version: '1' },
+    servers: [{ url: 'https://api.example.com' }],
+    paths: {
+      '/things': {
+        post: {
+          requestBody: {
+            content: {
+              'application/json': {
+                example: {
+                  reference: 'REF-1',
+                  nickname: 'optional one',
+                  material: { partNumber: 'ABC-123', colour: 'red' },
+                  plants: [{ plant: '1010' }],
+                },
+                schema: {
+                  type: 'object',
+                  required: ['reference', 'material'],
+                  properties: {
+                    reference: { type: 'string' },
+                    nickname: { type: 'string' },
+                    material: {
+                      type: 'object',
+                      required: ['partNumber'],
+                      properties: {
+                        partNumber: { type: 'string' },
+                        colour: { type: 'string' },
+                      },
+                    },
+                    plants: { type: 'array', items: { type: 'object' } },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 201: { description: 'Created' } },
+        },
+      },
+    },
+  };
+
+  const result = parseOpenApi(spec);
+  const body = JSON.parse(result.requests[0].body.content);
+
+  assertEqual(Object.keys(body).sort().join(','), 'material,reference', 'only required at root');
+  assertEqual(body.reference, 'REF-1', "the example's value is kept, not a fresh placeholder");
+  assertEqual(Object.keys(body.material).join(','), 'partNumber', 'and required only when nested');
+  assert(!('plants' in body), 'an optional array is dropped entirely');
+
+  // Dropping without saying so would hide half the endpoint.
+  const warning = result.warnings.find((w) => w.includes('required fields only'));
+  assert(warning, `should report what it dropped, got: ${result.warnings.join(' | ')}`);
+  assert(warning.includes('nickname'), 'names an optional root field');
+  assert(warning.includes('material.colour'), 'and a nested one, by path');
+});
+
+await test('openapi: a schema that requires nothing keeps its example intact', () => {
+  // Reducing here would produce {}, which is not a useful starting point and is very likely
+  // invalid for reasons the (absent) required array cannot express.
+  const spec = {
+    openapi: '3.1.0',
+    info: { title: 'NoRequired', version: '1' },
+    servers: [{ url: 'https://api.example.com' }],
+    paths: {
+      '/things': {
+        post: {
+          requestBody: {
+            content: {
+              'application/json': {
+                example: { a: 1, b: 2 },
+                schema: {
+                  type: 'object',
+                  properties: { a: { type: 'integer' }, b: { type: 'integer' } },
+                },
+              },
+            },
+          },
+          responses: { 201: { description: 'Created' } },
+        },
+      },
+    },
+  };
+
+  const body = JSON.parse(parseOpenApi(spec).requests[0].body.content);
+  assertEqual(Object.keys(body).sort().join(','), 'a,b', 'left exactly as it was');
 });
 
 summarise('import');

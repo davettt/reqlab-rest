@@ -8,11 +8,38 @@
  *
  * Precedence, lowest to highest: project variables < environment variables < captured values.
  */
+import crypto from 'crypto';
 import { decrypt } from './crypto.js';
 
-const PLACEHOLDER = /\{\{\s*([\w.-]+)\s*\}\}/g;
+// `$` is allowed so the generated values below can be referenced as {{$uuid}} and friends.
+const PLACEHOLDER = /\{\{\s*([\w.$-]+)\s*\}\}/g;
 const MAX_NESTING = 5;
 export const MASK = '••••';
+
+/**
+ * Values generated per send, for the fields that must differ on every genuine request.
+ *
+ * An `Idempotency-Key` is the motivating case: it has to be a fresh value for each new
+ * operation, and typing one in by hand before every send makes the request unusable as a
+ * saved thing.
+ *
+ * Two properties worth stating, because both are load-bearing:
+ *
+ *  - **One value per send, not per occurrence.** The same {{$uuid}} in a header and in the
+ *    body resolves to the same string, so a request that correlates the two works, and the
+ *    recorded run shows the value that was actually sent rather than a third one.
+ *  - **A variable of the same name wins.** Defining `$uuid` in an environment pins it, which
+ *    is how you test the retry path: an idempotency key is only meaningful if you can also
+ *    send the *same* one twice on purpose.
+ */
+const DYNAMIC = {
+  $uuid: () => crypto.randomUUID(),
+  $timestamp: () => String(Math.floor(Date.now() / 1000)),
+  $isoTimestamp: () => new Date().toISOString(),
+  $randomInt: () => String(crypto.randomInt(0, 1_000_000)),
+};
+
+export const DYNAMIC_NAMES = Object.keys(DYNAMIC);
 
 /**
  * Build the lookup used by every interpolate call. Secret values are decrypted here and
@@ -54,6 +81,13 @@ export function buildScope({ projectVars = [], envVars = [], captures = {} } = {
       secret: isWrapped ? Boolean(capture.secret) : false,
       error: null,
     });
+  }
+
+  // Last, and only where nothing has claimed the name: a variable the user defined called
+  // $uuid is a deliberate override, and overriding is the documented way to pin one.
+  for (const [name, generate] of Object.entries(DYNAMIC)) {
+    if (scope.has(name)) continue;
+    scope.set(name, { value: generate(), secret: false, error: null });
   }
 
   return scope;

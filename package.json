@@ -39,8 +39,9 @@
     "test:verify": "node tests/verify.js",
     "test:smoke": "node tests/smoke.js",
     "test:integration": "node tests/harness.js integration",
-    "test": "npm run test:unit && npm run test:exec && npm run test:import && npm run test:codegen && npm run test:ai && npm run test:verify && npm run test:api && npm run test:smoke && npm run test:integration",
-    "prepare": "husky"
+    "test": "npm run test:unit && npm run test:exec && npm run test:import && npm run test:codegen && npm run test:ai && npm run test:verify && npm run test:scenarios && npm run test:api && npm run test:smoke && npm run test:integration",
+    "prepare": "husky",
+    "test:scenarios": "node tests/scenarios.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

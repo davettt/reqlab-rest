@@ -151,6 +151,16 @@ export default function VariableEditor({ variables, onSave }: Props) {
         encrypted when saved, and nothing is written to disk until you press Save. Use a variable
         anywhere as <code className="text-slate-500">{'{{name}}'}</code>.
       </p>
+
+      <p className="text-xs text-slate-600">
+        Generated per send, without being defined here:{' '}
+        <code className="text-slate-500">{'{{$uuid}}'}</code>,{' '}
+        <code className="text-slate-500">{'{{$timestamp}}'}</code>,{' '}
+        <code className="text-slate-500">{'{{$isoTimestamp}}'}</code>,{' '}
+        <code className="text-slate-500">{'{{$randomInt}}'}</code>. One value per send, so the same
+        one used twice in a request matches. Defining a variable with that name pins it — which is
+        how you send the same idempotency key twice on purpose.
+      </p>
     </div>
   );
 }

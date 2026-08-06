@@ -97,7 +97,7 @@ export function parseOpenApi(doc) {
         }
       }
 
-      const body = buildRequestBody(doc, operation, warnings);
+      const body = buildRequestBody(doc, operation, warnings, `${method.toUpperCase()} ${path}`);
       if (body) request.body = body;
 
       applySecurity({
@@ -111,15 +111,51 @@ export function parseOpenApi(doc) {
 
       // A spec states the success status; asserting it makes an imported request immediately
       // useful as a check rather than just a saved URL.
-      const success = Object.keys(operation.responses ?? {}).find((code) => /^2\d\d$/.test(code));
-      if (success) {
+      //
+      // When an operation documents more than one success status, no single code is the right
+      // assertion — the API is permitted to answer with any of them, and picking one produces
+      // a check that fails on a correct response. A create that documents both 201 and a 200
+      // idempotent replay is the common case, and asserting 200 there fails every first call.
+      const successCodes = Object.keys(operation.responses ?? {})
+        .filter((code) => /^2\d\d$/.test(code))
+        .sort();
+
+      if (successCodes.length === 1) {
         request.assertions.push({
           type: 'status',
           target: '',
           operator: 'equals',
-          expected: success,
+          expected: successCodes[0],
           enabled: true,
         });
+      } else if (successCodes.length > 1) {
+        request.assertions.push({
+          type: 'status',
+          target: '',
+          operator: 'lessThan',
+          expected: '300',
+          enabled: true,
+        });
+        warnings.add(
+          `${request.method} ${path} documents more than one success status ` +
+            `(${successCodes.join(', ')}), so the imported check asserts any 2xx rather than ` +
+            'one of them. Narrow it by hand if you want to pin a specific code.',
+        );
+      }
+
+      // A literal Idempotency-Key taken from the spec's example is a trap: the second send
+      // replays the first response instead of doing anything, or is rejected outright if the
+      // body changed. The header is standard enough to name specifically.
+      const idempotency = request.headers.find(
+        (h) => h.key.toLowerCase() === 'idempotency-key' && h.value,
+      );
+      if (idempotency) {
+        warnings.add(
+          `${request.method} ${path} takes an Idempotency-Key, imported with the example value ` +
+            `"${idempotency.value}". Change it for each genuinely new request — reusing it is ` +
+            'how the API is told "this is a retry", so a second send will replay the first ' +
+            'response rather than create anything.',
+        );
       }
 
       // Specs frequently document an API key as an ordinary parameter rather than declaring
@@ -167,6 +203,22 @@ function openApi3BaseUrl(doc, warnings) {
     return '';
   }
 
+  // Taking the first server silently is fine until the list happens to be ordered with
+  // production first, at which point an import points a test tool at live data without ever
+  // saying so. Name the choice and the alternatives and let the reader decide.
+  if ((doc.servers?.length ?? 0) > 1) {
+    const others = doc.servers
+      .slice(1)
+      .map((s) => (s.description ? `${s.url} (${s.description})` : s.url))
+      .join(', ');
+
+    warnings.add(
+      `The spec lists ${doc.servers.length} servers. baseUrl is set to the first, ` +
+        `${server.url}${server.description ? ` (${server.description})` : ''}. The others are: ` +
+        `${others}. Check baseUrl before sending anything that writes.`,
+    );
+  }
+
   // Server templates ({region}.api.example.com) are resolved from their declared default.
   return server.url.replace(/\{(\w+)\}/g, (match, name) => {
     const variable = server.variables?.[name];
@@ -211,7 +263,7 @@ function operationName(operation, method, path) {
  * Bodies
  * ---------------------------------------------------------------- */
 
-function buildRequestBody(doc, operation, warnings) {
+function buildRequestBody(doc, operation, warnings, label) {
   const requestBody = resolveRef(doc, operation.requestBody);
   if (!requestBody?.content) return null;
 
@@ -221,8 +273,46 @@ function buildRequestBody(doc, operation, warnings) {
 
   if (json) {
     const schema = requestBody.content[json].schema;
-    const example = requestBody.content[json].example ?? sampleFromSchema(doc, schema);
-    return { type: 'json', content: JSON.stringify(example, null, 2) };
+    const declared = requestBody.content[json].example;
+    let value = declared ?? sampleFromSchema(doc, schema);
+
+    // A spec's own example is preferred over anything generated — it is written by someone who
+    // knows the API. It is not, however, guaranteed to be valid: examples drift from the schema
+    // they sit beside. A missing required field would be imported verbatim and rejected on the
+    // first send, which reads as a fault in this tool rather than in the document.
+    if (declared !== undefined) {
+      const missing = [];
+      value = fillMissingRequired(doc, schema, value, missing);
+
+      if (missing.length) {
+        warnings.add(
+          `${label}: the specification's example omits required field` +
+            `${missing.length === 1 ? '' : 's'} ${missing.join(', ')}. ` +
+            'A placeholder has been filled in from the schema — replace it before sending.',
+        );
+      }
+    }
+
+    describeRequired(doc, schema, warnings, label);
+
+    // Reduce to the required fields.
+    //
+    // A specification's example demonstrates the endpoint's full range, which is the opposite
+    // of what you want in a request you are about to send: it arrives holding illustrative
+    // business codes for every optional field, each of which the API then tries to resolve and
+    // rejects. A body you add to is easier to work with than one you have to prune, and the
+    // fields left out are named below so nothing becomes invisible.
+    const omitted = [];
+    const minimal = requiredOnly(doc, schema, value, omitted);
+
+    if (omitted.length) {
+      warnings.add(
+        `${label}: the body holds the required fields only. The specification's example also ` +
+          `showed ${omitted.join(', ')} — add any you need.`,
+      );
+    }
+
+    return { type: 'json', content: JSON.stringify(minimal, null, 2) };
   }
 
   if (form) {
@@ -255,6 +345,9 @@ function sampleFromSchema(doc, schema, depth = 0, seen = new Set()) {
   if (resolved.example !== undefined) return resolved.example;
   if (resolved.default !== undefined) return resolved.default;
   if (resolved.enum?.length) return resolved.enum[0];
+  // OpenAPI 3.1 is JSON Schema 2020-12, where `const` is a single permitted value. Without
+  // this it fell through to the type and produced "string" where only one literal is valid.
+  if (resolved.const !== undefined) return resolved.const;
 
   const composed = resolved.allOf ?? resolved.oneOf ?? resolved.anyOf;
   if (composed?.length) return sampleFromSchema(doc, composed[0], depth + 1, seen);
@@ -273,8 +366,24 @@ function sampleFromSchema(doc, schema, depth = 0, seen = new Set()) {
       }
       return out;
     }
-    case 'array':
-      return [sampleFromSchema(doc, resolved.items, depth + 1, seen)].filter((v) => v !== null);
+    case 'array': {
+      // A schema permitting no entries must sample as empty. Generating one anyway produced a
+      // body the API documents as invalid — a reserved field with maxItems: 0 is the case that
+      // exposed this, where the generated entry is rejected outright.
+      const max = typeof resolved.maxItems === 'number' ? resolved.maxItems : Infinity;
+      if (max <= 0) return [];
+
+      const min = typeof resolved.minItems === 'number' ? resolved.minItems : 0;
+      // One entry is enough to show the shape; more only when the schema insists on it.
+      const count = Math.min(Math.max(min, 1), max);
+
+      const items = [];
+      for (let i = 0; i < count; i += 1) {
+        const item = sampleFromSchema(doc, resolved.items, depth + 1, seen);
+        if (item !== null) items.push(item);
+      }
+      return items;
+    }
     case 'integer':
     case 'number':
       return 0;
@@ -283,6 +392,164 @@ function sampleFromSchema(doc, schema, depth = 0, seen = new Set()) {
     default:
       return placeholderForFormat(resolved.format);
   }
+}
+
+/**
+ * Fill in any required field the example left out, and report which ones those were.
+ *
+ * Only ever adds: a value the example does supply is never replaced, however odd it looks,
+ * because the example's author knows things the schema does not. Recurses through objects the
+ * example actually contains and through array entries it actually has — an absent optional
+ * array is left absent rather than conjured into existence, since its contents are only
+ * required once you choose to send it.
+ */
+function fillMissingRequired(doc, schema, value, missing, path = '', depth = 0) {
+  const resolved = resolveRef(doc, schema);
+  if (!resolved || depth > 6) return value;
+
+  if (resolved.type === 'array' || Array.isArray(value)) {
+    if (!Array.isArray(value) || !resolved.items) return value;
+    return value.map((entry, i) =>
+      fillMissingRequired(doc, resolved.items, entry, missing, `${path}[${i}]`, depth + 1),
+    );
+  }
+
+  if (!isPlainObject(value) || !resolved.properties) return value;
+
+  const out = { ...value };
+
+  for (const name of resolved.required ?? []) {
+    const property = resolved.properties[name];
+    if (!property || name in out) continue;
+
+    missing.push(path ? `${path}.${name}` : name);
+    out[name] = sampleFromSchema(doc, property, depth + 1);
+  }
+
+  for (const [name, property] of Object.entries(resolved.properties)) {
+    if (!(name in out)) continue;
+    out[name] = fillMissingRequired(
+      doc,
+      property,
+      out[name],
+      missing,
+      path ? `${path}.${name}` : name,
+      depth + 1,
+    );
+  }
+
+  return out;
+}
+
+/**
+ * Keep only the fields the schema requires, recording the names of those dropped.
+ *
+ * Values are taken from whatever was already there — the specification's own example where it
+ * supplied one — so the result is the example narrowed, not a fresh set of placeholders.
+ *
+ * A schema that requires nothing is left exactly as it was: reducing it would produce `{}`,
+ * which is not a helpful starting point and is very likely invalid for reasons the `required`
+ * array does not capture.
+ */
+function requiredOnly(doc, schema, value, omitted, path = '', depth = 0) {
+  const resolved = resolveRef(doc, schema);
+  if (!resolved || depth > 6) return value;
+
+  if (Array.isArray(value)) {
+    if (!resolved.items) return value;
+    return value.map((entry) => requiredOnly(doc, resolved.items, entry, omitted, path, depth + 1));
+  }
+
+  if (!isPlainObject(value) || !resolved.properties) return value;
+
+  const required = new Set(resolved.required ?? []);
+  if (!required.size) return value;
+
+  const out = {};
+  for (const [name, entry] of Object.entries(value)) {
+    const full = path ? `${path}.${name}` : name;
+
+    if (!required.has(name)) {
+      pushUnique(omitted, full);
+      continue;
+    }
+    out[name] = requiredOnly(doc, resolved.properties[name], entry, omitted, full, depth + 1);
+  }
+  return out;
+}
+
+/**
+ * State which fields the body requires, separating the unconditional from the conditional.
+ *
+ * The distinction is the whole point. A flat list saying `plant` is required is misleading:
+ * `plants` is optional, and `plant` only becomes required once you decide to send an entry in
+ * it. Reported as a warning rather than dropped, because the schema knows this and the imported
+ * JSON body — a flat blob of text — cannot express it.
+ */
+function describeRequired(doc, schema, warnings, label) {
+  const always = [];
+  const conditional = new Map();
+
+  walkRequired(doc, schema, { always, conditional, path: '', condition: null, depth: 0 });
+
+  if (always.length) {
+    warnings.add(`${label} requires ${always.join(', ')}.`);
+  }
+
+  for (const [condition, fields] of conditional) {
+    warnings.add(
+      `${label}: if you include ${condition}, each entry requires ${fields.join(', ')}.`,
+    );
+  }
+}
+
+function walkRequired(doc, schema, ctx) {
+  const resolved = resolveRef(doc, schema);
+  if (!resolved?.properties || ctx.depth > 6) return;
+
+  const required = new Set(resolved.required ?? []);
+
+  for (const name of required) {
+    const full = ctx.path ? `${ctx.path}.${name}` : name;
+    if (ctx.condition) {
+      if (!ctx.conditional.has(ctx.condition)) ctx.conditional.set(ctx.condition, []);
+      ctx.conditional.get(ctx.condition).push(name);
+    } else {
+      pushUnique(ctx.always, full);
+    }
+  }
+
+  for (const [name, property] of Object.entries(resolved.properties)) {
+    const child = resolveRef(doc, property);
+    if (!child) continue;
+
+    const full = ctx.path ? `${ctx.path}.${name}` : name;
+
+    if (child.type === 'array' && child.items) {
+      // Entries in an array are always conditional: sending none is valid unless minItems says
+      // otherwise, and an array capped at zero entries can never carry anything at all.
+      if (child.maxItems === 0) continue;
+      walkRequired(doc, child.items, {
+        ...ctx,
+        path: `${full}[]`,
+        condition: `${full}[]`,
+        depth: ctx.depth + 1,
+      });
+    } else if (child.properties) {
+      // A required object keeps its parent's condition; an optional one introduces its own.
+      const condition = ctx.condition ?? (required.has(name) ? null : full);
+      walkRequired(doc, child, { ...ctx, path: full, condition, depth: ctx.depth + 1 });
+    }
+  }
+}
+
+/** Push without duplicating — the same field can be reached twice through a shared $ref. */
+function pushUnique(list, value) {
+  if (!list.includes(value)) list.push(value);
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function placeholderForFormat(format) {

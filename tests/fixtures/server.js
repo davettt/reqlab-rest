@@ -24,6 +24,11 @@ export const PLANTED_DEFECTS = [
   { id: 'duplicate-across-pages', route: 'GET /broken/items', expected: 'stable pagination' },
   { id: 'non-idempotent-put', route: 'PUT /broken/counter', expected: 'same result on repeat' },
   { id: 'missing-etag', route: 'GET /broken/document', expected: 'ETag header' },
+  {
+    id: 'non-json-error',
+    route: 'POST /broken/html-error',
+    expected: 'the documented JSON error envelope',
+  },
 ];
 
 export function createFixtureApp() {
@@ -220,6 +225,15 @@ export function createFixtureApp() {
     res.set('etag', '"v1"').set('cache-control', 'max-age=60').json({ body: 'hello' });
   });
 
+  // PUT sets rather than increments, so repeating it gives the same answer — which is what
+  // PUT is defined to do, and the twin that proves the idempotency suite is not just flagging
+  // every write it sees.
+  let goodCounter = 0;
+  app.put('/good/counter', (req, res) => {
+    goodCounter = Number(req.body?.counter ?? 1);
+    res.json({ counter: goodCounter, updatedAt: new Date().toISOString() });
+  });
+
   /* ================================================================
    * BROKEN endpoints — each defect is intentional. See PLANTED_DEFECTS.
    * ============================================================== */
@@ -270,6 +284,37 @@ export function createFixtureApp() {
     res.json({ counter });
   });
   app.get('/broken/counter', (_req, res) => res.json({ counter }));
+
+  // BROKEN: answers an error with an HTML page rather than the API's own JSON envelope —
+  // the way a proxy, a load balancer or a framework's default handler does when it rejects a
+  // request before the application sees it. A caller parsing the body throws.
+  app.post('/broken/html-error', (_req, res) => {
+    res
+      .status(400)
+      .type('html')
+      .send('<!doctype html><html><body><h1>400 Bad Request</h1></body></html>');
+  });
+
+  // BROKEN: advertises its framework and version, the free reconnaissance most stacks emit
+  // by default. Its correct twin is every other endpoint here, since the app disables the
+  // header globally.
+  app.get('/broken/banner', (_req, res) => {
+    res.set('x-powered-by', 'Express').json({ ok: true });
+  });
+
+  // BROKEN, but differently: a web-server error page, the shape a proxy produces when it
+  // answers before the application is reached. Distinguished from the case above because it
+  // usually means deliberate edge hardening rather than a fault in the API's own handling.
+  app.post('/broken/edge-error', (_req, res) => {
+    res
+      .status(405)
+      .set('server', 'nginx')
+      .type('html')
+      .send(
+        '<html><head><title>405 Not Allowed</title></head><body>' +
+          '<center><h1>405 Not Allowed</h1></center><hr><center>nginx</center></body></html>',
+      );
+  });
 
   // BROKEN: no ETag or Cache-Control, so conditional requests cannot work.
   app.get('/broken/document', (_req, res) => res.json({ body: 'hello' }));

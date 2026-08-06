@@ -18,6 +18,11 @@ export interface KeyValue {
 
 export interface Variable extends KeyValue {
   secret: boolean;
+  /**
+   * Server-assigned, and the reason renaming a secret no longer loses it: the server matches
+   * on this rather than on the key. Absent on a row that has not been saved yet.
+   */
+  id?: string;
 }
 
 export interface RequestBody {
@@ -181,6 +186,21 @@ export interface VerifySummary {
   passed: boolean;
 }
 
+export interface LatencyStats {
+  samples: number;
+  min: number;
+  p50: number;
+  p95: number;
+  p99: number;
+  max: number;
+}
+
+/** Present only when the latency suite ran — it is the one suite producing more than findings. */
+export interface LatencyResult {
+  measurements: Record<string, LatencyStats>;
+  comparedAgainst: number | null;
+}
+
 export interface VerifyRun {
   id: string;
   target: string;
@@ -188,8 +208,48 @@ export interface VerifyRun {
   finishedAt: number;
   suites: string[];
   skipped: { suite: string; reason: string }[];
+  latency: LatencyResult | null;
   findings: VerifyFinding[];
   summary: VerifySummary;
+}
+
+export interface ScenarioStep {
+  requestId: string;
+  name?: string;
+}
+
+export interface Scenario {
+  id: string;
+  name: string;
+  description?: string;
+  createdAt: number;
+  steps: ScenarioStep[];
+}
+
+export interface ScenarioStepResult {
+  position: number;
+  name: string;
+  requestId: string;
+  method?: string;
+  url?: string;
+  status: number | null;
+  timingMs: number | null;
+  body?: string;
+  assertions?: AssertionResult[];
+  captured?: string[];
+  error?: string;
+  outcome: 'passed' | 'failed' | 'error' | 'missing' | 'not-run';
+}
+
+export interface ScenarioRun {
+  id: string;
+  scenarioId: string;
+  name: string;
+  startedAt: number;
+  finishedAt: number;
+  steps: ScenarioStepResult[];
+  passed: boolean;
+  findings: VerifyFinding[];
 }
 
 export interface AiSettings {

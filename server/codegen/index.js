@@ -8,7 +8,7 @@
  * version control. By default every secret becomes an environment-variable reference in the
  * target language, and the caller has to ask explicitly for the resolved value.
  */
-import { interpolate, interpolateDeep } from '../vars.js';
+import { interpolate, interpolateDeep, referencedVars, DYNAMIC_NAMES } from '../vars.js';
 import { buildBody } from '../exec/bodies.js';
 
 export const TARGETS = ['curl', 'fetch', 'tanstack', 'axios', 'python'];
@@ -307,6 +307,21 @@ export function generate(definition, scope, target, options = {}) {
   }
   if (resolved.secrets.some((s) => s.note)) {
     notes.push('OAuth2 needs a token exchange first; the snippet shows where the token goes.');
+  }
+
+  // A generated value is generated once, at export. Left unsaid, a snippet carrying a frozen
+  // Idempotency-Key looks correct and does the opposite of what the header is for: every run
+  // of it is treated by the server as a retry of the first.
+  // Parsed with the same placeholder grammar the resolver uses, rather than a hand-built
+  // pattern, so "{{ $uuid }}" is recognised exactly as the resolver recognised it.
+  const referenced = new Set(referencedVars(JSON.stringify(definition ?? {})));
+  const dynamic = DYNAMIC_NAMES.filter((name) => referenced.has(name));
+  if (dynamic.length) {
+    notes.push(
+      `${dynamic.join(', ')} ${dynamic.length === 1 ? 'was' : 'were'} resolved to a fixed value ` +
+        'when this snippet was generated. Generate a fresh one in your own code if the request ' +
+        'needs a different value each time — an Idempotency-Key reused is read as a retry.',
+    );
   }
 
   return { code, secrets: envNames, notes };

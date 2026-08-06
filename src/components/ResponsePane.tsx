@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useStore } from '../stores/appStore';
+import { diffBodies } from '../lib/diff';
 import {
   formatBytes,
   formatMs,
@@ -9,11 +10,11 @@ import {
   type RunResult,
 } from '../types';
 
-const TABS = ['Body', 'Headers', 'Request', 'Cookies', 'Timing', 'Checks'] as const;
+const TABS = ['Body', 'Headers', 'Request', 'Cookies', 'Timing', 'Checks', 'Diff'] as const;
 type Tab = (typeof TABS)[number];
 
 export default function ResponsePane() {
-  const { result, running } = useStore();
+  const { result, previous, running } = useStore();
   const [tab, setTab] = useState<Tab>('Body');
 
   if (running) {
@@ -85,6 +86,7 @@ export default function ResponsePane() {
         {tab === 'Cookies' && <CookieView result={result} />}
         {tab === 'Timing' && <TimingView result={result} />}
         {tab === 'Checks' && <ChecksView result={result} />}
+        {tab === 'Diff' && <DiffView result={result} previous={previous} />}
       </div>
     </div>
   );
@@ -329,6 +331,65 @@ function RequestView({ result }: { result: RunResult }) {
             {result.finalRequest.method} {result.finalRequest.url}
           </p>
           <Table rows={Object.entries(result.finalRequest.headers)} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * What changed since the last time this request was sent.
+ *
+ * Values that move on every call — timestamps, request ids, ETags — are excluded, because a
+ * diff that reports those is noise and noise teaches people to stop reading the diff. That
+ * exclusion means an empty diff is a real statement: nothing meaningful changed.
+ */
+function DiffView({ result, previous }: { result: RunResult; previous: RunResult | null }) {
+  if (!previous) {
+    return (
+      <p className="text-sm text-slate-500">
+        Send this request again and the response will be compared against this one.
+      </p>
+    );
+  }
+
+  const statusChanged = previous.response.status !== result.response.status;
+  const differences = diffBodies(previous.response.body, result.response.body);
+
+  if (!statusChanged && differences.length === 0) {
+    return (
+      <p className="text-sm text-slate-400">
+        Nothing changed since the previous send.
+        <span className="mt-1 block text-xs text-slate-600">
+          Fields that move on every call — timestamps, ids, ETags — are excluded from this
+          comparison.
+        </span>
+      </p>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-3 text-xs">
+      {statusChanged && (
+        <p className="text-slate-300">
+          Status went from{' '}
+          <span className={statusTone(previous.response.status)}>{previous.response.status}</span>{' '}
+          to <span className={statusTone(result.response.status)}>{result.response.status}</span>.
+        </p>
+      )}
+
+      {differences.length > 0 && (
+        <div>
+          <p className="mb-1 text-slate-400">
+            {differences.length} field{differences.length === 1 ? '' : 's'} changed
+          </p>
+          <ul className="flex flex-col gap-1">
+            {differences.map((difference, i) => (
+              <li key={i} className="font-mono break-all text-slate-300">
+                {difference}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </div>

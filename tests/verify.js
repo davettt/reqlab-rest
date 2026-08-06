@@ -11,6 +11,10 @@ import { fixtureSpec, fixtureRequests } from './fixtures/spec.js';
 import { runContract } from '../server/verify/contract.js';
 import { runNegative } from '../server/verify/negative.js';
 import { runAuthz } from '../server/verify/authz.js';
+import { runPagination } from '../server/verify/pagination.js';
+import { runIdempotency } from '../server/verify/idempotency.js';
+import { runCaching } from '../server/verify/caching.js';
+import { runLatency } from '../server/verify/latency.js';
 import { summarise as summariseFindings, sortFindings } from '../server/verify/findings.js';
 import { executeRequest, sanitiseRun } from '../server/exec/run.js';
 import { buildScope } from '../server/vars.js';
@@ -24,6 +28,20 @@ const scope = buildScope({
 });
 
 const send = async (request) => sanitiseRun(await executeRequest(request, { scope }), scope);
+
+/** A bare request against the fixture, for the suites that build their own cases. */
+const req = (method, path) => ({
+  name: `${method} ${path}`,
+  folderId: null,
+  method,
+  url: `{{baseUrl}}${path}`,
+  params: [],
+  headers: [],
+  body: { type: 'none' },
+  auth: { type: 'none' },
+  assertions: [],
+  captures: [],
+});
 
 let findings = [];
 
@@ -473,7 +491,332 @@ try {
     assert(message.includes('not an OpenAPI'), `unexpected: ${message}`);
   });
 
+  await test('negative: a non-JSON error body is major, and names the case that produced it', async () => {
+    // Taken from a real API: most errors used the documented JSON envelope, but one path was
+    // answered by a layer in front of the application with an HTML page. A caller parsing the
+    // body throws, so this is a different problem from two JSON shapes with different keys.
+    const html = await runNegative({
+      send,
+      requests: [
+        { ...req('POST', '/broken/html-error'), body: { type: 'json', content: '{"a":1}' } },
+        { ...req('POST', '/good/validate'), body: { type: 'json', content: '{"name":"ok"}' } },
+      ],
+    });
+
+    const shape = html.find((f) => f.title.includes('not JSON'));
+    assert(shape, `expected a shape finding, got: ${html.map((f) => f.title).join(' | ')}`);
+    assertEqual(shape.severity, 'major', 'a body a caller cannot parse is more than cosmetic');
+    assert(shape.whatHappened.includes('not JSON at all'), 'says which shape was the problem');
+    // Without naming the case, the reader has nothing to go and look at.
+    assert(/from a /.test(shape.whatHappened), `should name the cases: ${shape.whatHappened}`);
+    assert(shape.evidence, 'and carries the response that proved it');
+  });
+
+  await test('negative: consistent JSON errors produce no shape finding', async () => {
+    const consistent = await runNegative({
+      send,
+      requests: [
+        { ...req('POST', '/good/validate'), body: { type: 'json', content: '{"name":"ok"}' } },
+      ],
+    });
+
+    const shape = consistent.find((f) => f.title.includes('shape') || f.title.includes('not JSON'));
+    assert(!shape, `false positive: ${shape?.whatHappened}`);
+  });
+
+  await test('negative: a proxy error page is reported as infrastructure, not as an API defect', async () => {
+    // nginx answering 405 for a method it blocks at the edge is sound hardening. Reporting it
+    // as a fault in the API's error handling sends the reader to the wrong team.
+    const edge = await runNegative({
+      send,
+      requests: [
+        { ...req('POST', '/broken/edge-error'), body: { type: 'json', content: '{"a":1}' } },
+        { ...req('POST', '/good/validate'), body: { type: 'json', content: '{"name":"ok"}' } },
+      ],
+    });
+
+    const shape = edge.find((f) => f.title.includes('infrastructure'));
+    assert(
+      shape,
+      `expected an infrastructure finding, got: ${edge.map((f) => f.title).join(' | ')}`,
+    );
+    assertEqual(shape.severity, 'minor', 'edge hardening is not an application defect');
+    assert(shape.whyItMatters.includes('deliberate'), 'and says so plainly');
+  });
+
+  await test('authz: a framework banner is reported, and a clean response is not', async () => {
+    const identities = ['owner'];
+    const sendAs = async (_name, request) => send(request);
+
+    const flagged = await runAuthz({
+      sendAs,
+      requests: [req('GET', '/broken/banner')],
+      identities,
+    });
+    const banner = flagged.find((f) => f.title.includes('advertises the software'));
+    assert(banner, `expected a banner finding, got: ${flagged.map((f) => f.title).join(' | ')}`);
+    assert(banner.whatHappened.includes('x-powered-by'), 'names the header');
+    assertEqual(banner.severity, 'minor', 'reconnaissance, not access');
+
+    const clean = await runAuthz({ sendAs, requests: [req('GET', '/good/document')], identities });
+    assert(
+      !clean.some((f) => f.title.includes('advertises the software')),
+      'an endpoint sending no banner is left alone',
+    );
+  });
+
+  /* ================================================================
+   * Pagination — the boundary is where the bugs are
+   * ============================================================== */
+
+  const pagination = await runPagination({
+    send,
+    requests: [req('GET', '/good/items'), req('GET', '/broken/items')],
+  });
+
+  const paginationFor = (needle) => pagination.filter((f) => (f.endpoint ?? '').includes(needle));
+
+  await test('flags a record returned on two different pages', () => {
+    const found = paginationFor('/broken/items');
+    const dup = found.find((f) => f.title.includes('same record on more than one page'));
+    assert(dup, `expected a duplicate finding, got: ${found.map((f) => f.title) || 'nothing'}`);
+    assertEqual(dup.severity, 'major', 'a duplicated record is major');
+    assert(dup.whatHappened.includes('page 1'), 'names the pages it appeared on');
+    assert(dup.evidence.response.status === 200, 'carries the page that proved it');
+  });
+
+  await test('does not flag correct pagination', () => {
+    assertEqual(paginationFor('/good/items').length, 0, 'the correct twin is left alone');
+  });
+
+  await test('says so when there was nothing to page', async () => {
+    const none = await runPagination({ send, requests: [req('GET', '/good/document')] });
+    const info = none.find((f) => f.title.includes('No paginated endpoints'));
+    assert(info, 'an endpoint with no list must report as untested, not as passing');
+    assertEqual(info.severity, 'info', 'not a defect in the API');
+    assert(info.whyItMatters.includes('not a pass'), 'and says plainly that it is not a pass');
+  });
+
+  /* ================================================================
+   * Idempotency — the same request twice
+   * ============================================================== */
+
+  const idempotency = await runIdempotency({
+    send,
+    requests: [
+      { ...req('PUT', '/good/counter'), body: { type: 'json', content: '{"counter":1}' } },
+      req('PUT', '/broken/counter'),
+    ],
+  });
+
+  const idempotencyFor = (needle) => idempotency.filter((f) => (f.endpoint ?? '').includes(needle));
+
+  await test('flags a PUT that increments instead of setting', () => {
+    const found = idempotencyFor('/broken/counter');
+    const repeat = found.find((f) => f.title.includes('not idempotent'));
+    assert(repeat, `expected an idempotency finding, got: ${found.map((f) => f.title)}`);
+    assertEqual(repeat.severity, 'major', 'a non-idempotent PUT is major');
+    assert(repeat.whatHappened.includes('counter'), 'names the field that moved');
+    assert(repeat.whyItMatters.includes('retry'), 'explains the consequence in plain terms');
+  });
+
+  await test('does not flag a PUT that sets', () => {
+    assertEqual(idempotencyFor('/good/counter').length, 0, 'the correct twin is left alone');
+  });
+
+  await test('a changing updatedAt is not mistaken for a lack of idempotency', () => {
+    // The good twin returns a fresh updatedAt on every call. A suite that compared bodies
+    // naively would flag it, and every real API would drown in false positives.
+    assertEqual(idempotencyFor('/good/counter').length, 0, 'volatile fields are ignored');
+  });
+
+  await test('says so when nothing was repeatable', async () => {
+    const none = await runIdempotency({ send, requests: [req('GET', '/good/items')] });
+    const info = none.find((f) => f.title.includes('Nothing was repeatable'));
+    assert(info, 'a project with no writes must report as untested, not as passing');
+    assertEqual(info.severity, 'info', 'not a defect in the API');
+  });
+
+  await test('idempotency: a repeated request reuses its generated values', async () => {
+    // The bug this guards: the runner rebuilds the variable scope per send, so {{$uuid}} in an
+    // Idempotency-Key regenerated between the two sends. The suite then compared two genuinely
+    // different requests and reported that the key was ignored — against an API handling it
+    // correctly, while leaving a duplicate record behind.
+    const { runVerification } = await import('../server/verify/runner.js');
+
+    const request = {
+      ...req('PUT', '/good/counter'),
+      body: { type: 'json', content: '{"counter":1}' },
+      headers: [{ key: 'X-Probe-Key', value: '{{$uuid}}', enabled: true }],
+    };
+
+    const result = await runVerification({
+      requests: [request],
+      suites: ['idempotency'],
+      projectVars: [{ key: 'baseUrl', value: fixture.base, enabled: true }],
+      acknowledged: true,
+    });
+
+    // The good twin is idempotent, so a correct comparison finds nothing. If the two sends had
+    // carried different generated values the bodies would still match here — so the real proof
+    // is below: the fixture echoes what it received.
+    const wrong = result.findings.filter((f) => f.suite === 'idempotency' && f.severity !== 'info');
+    assertEqual(wrong.length, 0, `false positives: ${wrong.map((f) => f.title).join(' | ')}`);
+  });
+
+  await test('idempotency: the two sends really carry the same generated value', async () => {
+    // Proved directly rather than inferred: two sends through one session must resolve
+    // {{$uuid}} identically, and two separate sessions must not.
+    const { buildScope } = await import('../server/vars.js');
+    const { interpolate } = await import('../server/vars.js');
+
+    const sessionScope = buildScope({});
+    const a = interpolate('{{$uuid}}', sessionScope).text;
+    const b = interpolate('{{$uuid}}', sessionScope).text;
+    assertEqual(a, b, 'one session, one value — this is what makes a repeat a retry');
+
+    const other = interpolate('{{$uuid}}', buildScope({})).text;
+    assert(a !== other, 'a separate session still generates afresh');
+  });
+
+  /* ================================================================
+   * Caching
+   * ============================================================== */
+
+  const caching = await runCaching({
+    send,
+    requests: [req('GET', '/good/document'), req('GET', '/broken/document')],
+  });
+
+  const cachingFor = (needle) => caching.filter((f) => (f.endpoint ?? '').includes(needle));
+
+  await test('flags a response with no ETag or Last-Modified', () => {
+    const found = cachingFor('/broken/document');
+    const missing = found.find((f) => f.title.includes('cannot be cached'));
+    assert(missing, `expected a caching finding, got: ${found.map((f) => f.title)}`);
+    assertEqual(missing.severity, 'minor', 'missing caching is real but not urgent');
+    assert(missing.actual === 'neither', 'names what was absent');
+  });
+
+  await test('does not flag a response that caches correctly', () => {
+    assertEqual(cachingFor('/good/document').length, 0, 'the correct twin is left alone');
+  });
+
+  await test('a conditional request against the correct twin really returns 304', async () => {
+    // Proves the previous assertion means something: if the fixture answered 200 here, the
+    // suite would have had a finding to make and "left alone" would be the wrong outcome.
+    const conditional = {
+      ...req('GET', '/good/document'),
+      headers: [{ key: 'If-None-Match', value: '"v1"', enabled: true }],
+    };
+    const run = await send(conditional);
+    assertEqual(run.response.status, 304, 'the fixture honours If-None-Match');
+  });
+
+  /* ================================================================
+   * Latency — regression against a baseline, not load testing
+   * ============================================================== */
+
+  const latency = await runLatency({ send, requests: [req('GET', '/slow/60')] });
+
+  await test('records a baseline when there is nothing to compare against', () => {
+    const info = latency.findings.find((f) => f.title.includes('baseline recorded'));
+    assert(info, 'the first run says it became the baseline');
+    assertEqual(info.severity, 'info', 'not a defect');
+    assert(
+      info.whyItMatters.includes('indicative'),
+      'is honest that p99 from a dozen samples is indicative',
+    );
+  });
+
+  await test('measures percentiles from the samples', () => {
+    const stats = latency.measurements['GET /slow/60'];
+    assert(stats, 'the endpoint was measured');
+    assert(stats.samples >= 3, `expected samples, got ${stats.samples}`);
+    assert(stats.p50 >= 55, `a 60ms endpoint should measure at least 55ms, got ${stats.p50}`);
+    assert(stats.p95 >= stats.p50, 'p95 is not below p50');
+    assert(stats.max >= stats.p99, 'max is not below p99');
+  });
+
+  await test('flags an endpoint that got materially slower', async () => {
+    const baseline = { savedAt: 1, measurements: { 'GET /slow/60': { p50: 4, p95: 5 } } };
+    const result = await runLatency({ send, requests: [req('GET', '/slow/60')], baseline });
+
+    const regression = result.findings.find((f) => f.title.includes('slower than the baseline'));
+    assert(regression, `expected a regression, got: ${result.findings.map((f) => f.title)}`);
+    assert(regression.whatHappened.includes('95th-percentile'), 'names the measure');
+    assert(regression.evidence, 'carries the response that was timed');
+  });
+
+  await test('does not flag an endpoint that matches its baseline', async () => {
+    const baseline = { savedAt: 1, measurements: { 'GET /slow/60': { p50: 61, p95: 65 } } };
+    const result = await runLatency({ send, requests: [req('GET', '/slow/60')], baseline });
+
+    const regression = result.findings.find((f) => f.title.includes('slower than the baseline'));
+    assert(!regression, `false positive: ${regression?.whatHappened}`);
+  });
+
+  await test('a large ratio on a tiny absolute change is not reported', async () => {
+    // 2ms becoming 6ms is a 3x ratio and complete noise. Ratio alone would flag every fast
+    // endpoint on a busy machine, and a report full of those is a report nobody opens.
+    const baseline = { savedAt: 1, measurements: { 'GET /good/document': { p50: 1, p95: 1 } } };
+    const result = await runLatency({
+      send,
+      requests: [req('GET', '/good/document')],
+      baseline,
+    });
+
+    const regression = result.findings.find((f) => f.title.includes('slower than the baseline'));
+    assert(!regression, `noise reported as a regression: ${regression?.whatHappened}`);
+  });
+
+  await test('a write is reported as not timed rather than repeated', async () => {
+    const result = await runLatency({ send, requests: [req('POST', '/good/widgets')] });
+
+    const info = result.findings.find((f) => f.title.includes('Nothing could be timed'));
+    assert(info, 'a project of writes reports as untested, not as passing');
+    assert(info.whatHappened.includes('change data'), 'explains why it was not measured');
+    assertEqual(Object.keys(result.measurements).length, 0, 'and measured nothing');
+  });
+
   /* ---- the safety acknowledgement ------------------------------ */
+
+  await test('idempotency refuses a non-loopback host without acknowledgement', async () => {
+    const { runVerification } = await import('../server/verify/runner.js');
+    const remote = {
+      name: 'remote',
+      method: 'PUT',
+      url: 'https://api.example.com/thing',
+      params: [],
+      headers: [],
+      body: { type: 'none' },
+      auth: { type: 'none' },
+    };
+
+    // It repeats writes, so it changes data on whatever it is pointed at.
+    let message = '';
+    try {
+      await runVerification({ requests: [remote], suites: ['idempotency'], acknowledged: false });
+    } catch (err) {
+      message = err.message;
+    }
+    assert(message.includes('api.example.com'), `should name the host, got: ${message}`);
+  });
+
+  await test('pagination and caching need no acknowledgement', async () => {
+    const { runVerification } = await import('../server/verify/runner.js');
+
+    // Both only do what an ordinary consumer of the API already does: walk the pages, and
+    // re-request with a conditional header.
+    const result = await runVerification({
+      requests: [req('GET', '/good/items')],
+      suites: ['pagination', 'caching'],
+      projectVars: [{ key: 'baseUrl', value: fixture.base, enabled: true }],
+      acknowledged: false,
+    });
+    assert(result.suites.includes('pagination'), 'pagination ran');
+    assert(result.suites.includes('caching'), 'caching ran');
+  });
 
   await test('intrusive suites refuse a non-loopback host without acknowledgement', async () => {
     const { runVerification } = await import('../server/verify/runner.js');

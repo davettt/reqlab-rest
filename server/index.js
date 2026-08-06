@@ -13,6 +13,7 @@ import { router as importRouter } from './routes/import.js';
 import { router as codegenRouter } from './routes/codegen.js';
 import { router as settingsRouter } from './routes/settings.js';
 import { router as verifyRouter } from './routes/verify.js';
+import { router as scenariosRouter } from './routes/scenarios.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -99,6 +100,7 @@ app.use('/api/import', importRouter);
 app.use('/api/codegen', codegenRouter);
 app.use('/api/settings', settingsRouter);
 app.use('/api/verify', verifyRouter);
+app.use('/api/scenarios', scenariosRouter);
 
 // Must precede the SPA fallback: otherwise a typo'd or removed API route returns the HTML
 // shell with status 200 in production, and the client parses it as a successful response.

@@ -12,7 +12,7 @@ import { z } from 'zod';
 import { encrypt } from './crypto.js';
 import { MASK } from './vars.js';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /* ---------------------------------------------------------------- *
  * Schemas
@@ -105,21 +105,28 @@ export const requestInput = z.object({
   captures: z.array(captureSchema).max(50).default([]),
 });
 
+/**
+ * A variable carries a stable id so it can be recognised after it is renamed.
+ *
+ * Without it, variables were matched by key alone, and renaming a secret looked exactly like
+ * creating a new empty one — so the stored value was silently discarded. The id is assigned by
+ * the server; a client that omits it (a new row, or a script) still works, it just cannot
+ * rename a secret in the same save.
+ */
+const variableSchema = keyValue.extend({
+  id: z.string().max(100).optional(),
+  secret: z.boolean().default(false),
+});
+
 export const projectInput = z.object({
   name: z.string().min(1).max(300),
   description: z.string().max(2000).default(''),
-  variables: z
-    .array(keyValue.extend({ secret: z.boolean().default(false) }))
-    .max(500)
-    .default([]),
+  variables: z.array(variableSchema).max(500).default([]),
 });
 
 export const environmentInput = z.object({
   name: z.string().min(1).max(300),
-  variables: z
-    .array(keyValue.extend({ secret: z.boolean().default(false) }))
-    .max(500)
-    .default([]),
+  variables: z.array(variableSchema).max(500).default([]),
 });
 
 export const transferInput = z.object({
@@ -178,26 +185,97 @@ export function newEnvironment(input) {
  * Secret handling
  * ---------------------------------------------------------------- */
 
+/** Raised when a masked secret arrives that cannot be matched to a stored one. */
+export class SecretMatchError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'SecretMatchError';
+    this.status = 400;
+  }
+}
+
+/** Give every variable a stable id, leaving any it already has alone. */
+export function withVariableIds(variables = []) {
+  return variables.map((v) => (v.id ? v : { ...v, id: newId() }));
+}
+
 /**
  * Encrypt any variable marked secret before it is written.
  *
- * A value equal to MASK means the client is echoing back what it was shown, so the stored
- * value is preserved. Without this, opening an environment and pressing save would replace
- * every secret with "••••".
+ * A value equal to MASK means the client is echoing back what it was shown, so the stored value
+ * is preserved. Without this, opening an environment and pressing save would replace every
+ * secret with "••••".
+ *
+ * Matching is by **id, then key**. Key alone was the original approach and it silently
+ * destroyed data: renaming a secret produced a variable whose key matched nothing stored, which
+ * was indistinguishable from a brand-new empty secret, so the value was dropped without a
+ * word. The id survives a rename, a reorder, and both in the same save.
+ *
+ * The key fallback is still needed for a client that does not send ids — a freshly typed row,
+ * or a script POSTing an environment — and for data written before ids existed.
+ *
+ * When neither matches, this **throws rather than storing an empty value**. Refusing a save is
+ * recoverable; silently discarding a credential the user cannot re-read is not.
  */
 export function encryptSecrets(incoming, existing = []) {
-  const previous = new Map(existing.map((v) => [v.key, v]));
+  const byId = new Map(existing.filter((v) => v.id).map((v) => [v.id, v]));
+  const byKey = new Map(existing.map((v) => [v.key, v]));
 
-  return incoming.map((variable) => {
+  return withVariableIds(incoming).map((variable) => {
     if (!variable.secret) return { ...variable, secret: false };
 
-    if (variable.value === MASK || variable.value === '') {
-      const prior = previous.get(variable.key);
-      return { ...variable, value: prior?.secret ? prior.value : '', secret: true };
+    if (variable.value !== MASK && variable.value !== '') {
+      return { ...variable, value: encrypt(variable.value), secret: true };
     }
-    return { ...variable, value: encrypt(variable.value), secret: true };
+
+    const prior = byId.get(variable.id) ?? byKey.get(variable.key);
+
+    // An empty value on a variable with no stored counterpart is a new, not-yet-filled secret,
+    // which is a normal thing to save. Only the *mask* implies a stored value that must exist.
+    if (!prior) {
+      if (variable.value === MASK) {
+        throw new SecretMatchError(
+          `The secret "${variable.key}" was sent as its mask (${MASK}), but no stored secret ` +
+            'matches it, so there is nothing to preserve. Re-enter the value and save again. ' +
+            '(This usually means the variable was renamed by a client that did not send its id.)',
+        );
+      }
+      return { ...variable, value: '', secret: true };
+    }
+
+    return { ...variable, value: prior.secret ? prior.value : '', secret: true };
   });
 }
+
+/* ---------------------------------------------------------------- *
+ * Migrations
+ * ---------------------------------------------------------------- */
+
+/**
+ * v1 → v2: give every variable a stable id.
+ *
+ * Purely additive — no value is read, rewritten or re-encrypted, so a failure part-way through
+ * leaves the data exactly as usable as before. `store.migrateDocument` still takes a snapshot
+ * of local_data first, since that is the guarantee the machinery makes.
+ */
+export const projectMigrations = {
+  1: (doc) => ({
+    ...doc,
+    schemaVersion: 2,
+    variables: withVariableIds(doc.variables ?? []),
+  }),
+};
+
+export const environmentsMigrations = {
+  1: (doc) => ({
+    ...doc,
+    schemaVersion: 2,
+    environments: (doc.environments ?? []).map((env) => ({
+      ...env,
+      variables: withVariableIds(env.variables ?? []),
+    })),
+  }),
+};
 
 /** Replace every secret value with MASK. Everything returned to the client goes through this. */
 export function maskSecrets(variables = []) {

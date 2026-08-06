@@ -12,18 +12,18 @@ machine — with one deliberate exception: if you use the AI import feature, the
 are sent to whichever provider you configured (Anthropic or OpenAI), under your own API key.
 Everything else, including every request the client sends and every lab run, is local.
 
-> **Status: in development.** Phase 0 (project scaffold and server skeleton) is complete.
-> The client and lab features listed below are being built phase by phase — see `CHANGELOG.md`
-> for what actually ships today.
+> **Status: in development.** The client, import and verification lab are built; the rate-limit
+> profiler is not yet. See `CHANGELOG.md` for what actually ships today.
 
-## Planned features
+## Features
 
 **Client**
 
-- Projects → folders → requests, with per-project environments
+- Projects → requests, with per-project environments
 - All the usual body types: JSON, form-urlencoded, multipart, raw, XML, GraphQL, binary
 - Auth helpers: bearer, basic, API key, OAuth2 client credentials
-- Response inspection: pretty JSON, raw, headers, cookies, timing waterfall, diff vs previous run
+- Response inspection: pretty JSON, raw, headers, cookies, the request as actually sent, a timing
+  waterfall, and a diff against the previous send
 - Assertions and value capture for chaining requests
 - Code export: curl, JS `fetch`, TanStack Query hook, Node axios, Python requests
 
@@ -34,10 +34,21 @@ Everything else, including every request the client sends and every lab run, is 
 - **Negative testing** — generated failure paths (bad auth, malformed bodies, wrong methods,
   oversized payloads) checking for correct status codes and no leaked internals
 - **Authorisation / IDOR** — cross-user access probes with two tokens, plus security hygiene checks
-- **Workflow scenarios** — ordered multi-step runs with captured values, diffed against a baseline
-- **Behaviour** — pagination correctness, idempotency, latency percentiles, caching
-- **Rate-limit profiler** — steady / burst / ramp modes that infer whether a limit is a fixed
-  window, sliding window, or token bucket, and report it in plain English
+- **Pagination** — duplicated or unreachable records across page boundaries, a moving total, an
+  ignored page size, a cursor that never terminates
+- **Idempotency** — a repeated PUT or DELETE compared against the first, and an Idempotency-Key
+  that is accepted but ignored
+- **Caching** — ETag and Last-Modified presence, conditional requests that really return 304, and
+  authenticated responses a shared proxy is allowed to store
+- **Latency** — percentiles per endpoint diffed against a saved baseline; only safe methods are
+  repeated, so this is regression detection, not load testing
+- **Workflow scenarios** — ordered multi-step runs where each step uses what the last one
+  captured, with every run diffed against the previous one
+- **Rate-limit profiler** _(not built yet)_ — steady / burst / ramp modes that infer whether a
+  limit is a fixed window, sliding window, or token bucket, and report it in plain English
+
+Every check produces a finding carrying the exact request and response that caused it, rendered
+as a self-contained HTML report or a terse markdown summary.
 
 **Import**
 

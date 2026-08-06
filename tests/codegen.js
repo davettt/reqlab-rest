@@ -190,4 +190,49 @@ await test('an unknown target is rejected', () => {
   assert(threw, 'should refuse');
 });
 
+await test('a generated value is flagged as frozen into the snippet', () => {
+  // The snippet inlines whatever the value resolved to. Unsaid, a frozen Idempotency-Key
+  // looks right and does the opposite of what the header is for: every run of the snippet is
+  // read by the server as a retry of the first.
+  const request = {
+    name: 'create',
+    method: 'POST',
+    url: '{{baseUrl}}/things',
+    params: [],
+    headers: [{ key: 'Idempotency-Key', value: '{{$uuid}}', enabled: true }],
+    body: { type: 'none' },
+    auth: { type: 'none' },
+  };
+
+  const scope = buildScope({
+    envVars: [{ key: 'baseUrl', value: 'https://api.test', enabled: true }],
+  });
+  const result = generate(request, scope, 'curl');
+
+  const note = result.notes.find((n) => n.includes('$uuid'));
+  assert(note, `expected a note, got: ${result.notes.join(' | ')}`);
+  assert(note.includes('Idempotency-Key'), 'and explains the consequence');
+
+  // The value itself is still real, so the snippet runs.
+  assert(/[0-9a-f-]{36}/.test(result.code), 'the resolved uuid is in the snippet');
+});
+
+await test('a request using no generated values gets no such note', () => {
+  const request = {
+    name: 'plain',
+    method: 'GET',
+    url: '{{baseUrl}}/things',
+    params: [],
+    headers: [],
+    body: { type: 'none' },
+    auth: { type: 'none' },
+  };
+  const scope = buildScope({
+    envVars: [{ key: 'baseUrl', value: 'https://api.test', enabled: true }],
+  });
+
+  const notes = generate(request, scope, 'curl').notes;
+  assert(!notes.some((n) => n.includes('$uuid')), `false positive: ${notes.join(' | ')}`);
+});
+
 summarise('codegen');

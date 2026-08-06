@@ -6,8 +6,11 @@
  */
 import express from 'express';
 import {
+  SCHEMA_VERSION,
   environmentInput,
+  environmentsMigrations,
   newId,
+  projectMigrations,
   transferInput,
   encryptSecrets,
   mergeAuthSecrets,
@@ -48,8 +51,34 @@ const projectFile = (id) => `${projectDir(id)}/project.json`;
 const requestFile = (pid, rid) => `${projectDir(pid)}/requests/${assertId(rid, 'request')}.json`;
 const environmentsFile = (id) => `${projectDir(id)}/environments.json`;
 
+/**
+ * Read a document, migrate it if it predates this build, and persist the result.
+ *
+ * Persisting matters: a migration applied on every read but never written back would hand out
+ * ids that vanish before the following save, which is precisely the mismatch the ids exist to
+ * prevent. `store.migrateDocument` snapshots local_data before the first migration in a
+ * process, and returns the document untouched when it is already current.
+ */
+async function loadMigrated(path, { fallback = null, migrations, label }) {
+  const doc = await store.readJson(path, fallback);
+  if (!doc) return doc;
+
+  const migrated = await store.migrateDocument(doc, {
+    targetVersion: SCHEMA_VERSION,
+    migrations,
+    label,
+  });
+
+  if (migrated !== doc) await store.writeJson(path, migrated);
+  return migrated;
+}
+
 async function loadProject(id) {
-  const project = await store.readJson(projectFile(id));
+  const project = await loadMigrated(projectFile(id), {
+    migrations: projectMigrations,
+    label: `Project ${id}`,
+  });
+
   if (!project) {
     const err = new Error('Project not found');
     err.status = 404;
@@ -70,7 +99,20 @@ async function loadRequests(projectId) {
 }
 
 async function loadEnvironments(projectId) {
-  return (await store.readJson(environmentsFile(projectId), { environments: [] })).environments;
+  const doc = await loadMigrated(environmentsFile(projectId), {
+    fallback: { schemaVersion: SCHEMA_VERSION, environments: [] },
+    migrations: environmentsMigrations,
+    label: `Environments for project ${projectId}`,
+  });
+  return doc.environments;
+}
+
+/** Every write must stamp the version, or the next read would migrate the document again. */
+async function saveEnvironments(projectId, environments) {
+  await store.writeJson(environmentsFile(projectId), {
+    schemaVersion: SCHEMA_VERSION,
+    environments,
+  });
 }
 
 /** Wraps an async handler so a rejection reaches Express's error handler. */
@@ -221,7 +263,7 @@ router.post(
     const environments = await loadEnvironments(req.params.id);
     const environment = newEnvironment(environmentInput.parse(req.body));
     environments.push(environment);
-    await store.writeJson(environmentsFile(req.params.id), { environments });
+    await saveEnvironments(req.params.id, environments);
     res.status(201).json(publicEnvironments([environment])[0]);
   }),
 );
@@ -243,7 +285,7 @@ router.patch(
         ? encryptSecrets(input.variables, existing.variables)
         : existing.variables,
     };
-    await store.writeJson(environmentsFile(req.params.id), { environments });
+    await saveEnvironments(req.params.id, environments);
     res.json(publicEnvironments([environments[index]])[0]);
   }),
 );
@@ -257,7 +299,7 @@ router.delete(
     if (remaining.length === environments.length) {
       return res.status(404).json({ error: 'Environment not found' });
     }
-    await store.writeJson(environmentsFile(req.params.id), { environments: remaining });
+    await saveEnvironments(req.params.id, remaining);
     res.status(204).end();
   }),
 );
@@ -315,9 +357,9 @@ router.post(
         if (input.mode === 'copy') keep.push(env);
       }
 
-      await store.writeJson(environmentsFile(target.id), { environments: targetEnvs });
+      await saveEnvironments(target.id, targetEnvs);
       if (input.mode === 'move') {
-        await store.writeJson(environmentsFile(source.id), { environments: keep });
+        await saveEnvironments(source.id, keep);
       }
     }
 

@@ -128,7 +128,16 @@ export async function executeRequest(def, options = {}) {
     authResult = await applyAuth(resolvedAuth, headers, url);
   } catch (err) {
     if (err instanceof HttpRequestError) throw err;
-    throw new HttpRequestError(`Could not apply authentication: ${err.message}`, err);
+    // An AuthValueError has already been written for a person to read, and deliberately says
+    // nothing about the credential's contents. Anything else is a platform error whose text
+    // may quote the value that broke it, so it is described rather than repeated.
+    if (err.name === 'AuthValueError') throw new HttpRequestError(err.message, err);
+
+    throw new HttpRequestError(
+      'The authentication could not be applied to this request. Check the Auth tab — the ' +
+        'values there are not shown in this message because they are credentials.',
+      err,
+    );
   }
   warnings.push(...authResult.warnings);
 

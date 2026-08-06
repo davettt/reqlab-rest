@@ -128,6 +128,67 @@ try {
     );
   });
 
+  await test('renaming a secret variable keeps the secret working', async () => {
+    // The bug this guards: variables used to be matched by key, so a rename looked like a new
+    // empty secret and the stored value was silently dropped. Asserted behaviourally — the
+    // renamed variable has to still authenticate, which a wiped secret cannot do.
+    const read = await api('GET', `/projects/${projectId}/environments`);
+    const environment = read.body.environments.find((e) => e.id === environmentId);
+    const renamed = environment.variables.map((v) =>
+      v.key === 'token' ? { ...v, key: 'apiToken' } : v,
+    );
+
+    const saved = await api('PATCH', `/projects/${projectId}/environments/${environmentId}`, {
+      name: environment.name,
+      variables: renamed,
+    });
+    assertEqual(saved.status, 200, 'the rename was accepted');
+    assertEqual(
+      saved.body.variables.find((v) => v.key === 'apiToken').value,
+      '••••',
+      'still masked, not blanked',
+    );
+
+    const run = await api('POST', '/run', {
+      projectId,
+      environmentId,
+      request: {
+        name: 'check renamed secret',
+        method: 'GET',
+        url: '{{baseUrl}}/auth/bearer',
+        auth: { type: 'bearer', token: '{{apiToken}}' },
+      },
+    });
+    assertEqual(run.body.response.status, 200, 'the renamed secret still authenticates');
+
+    // Put it back, so the tests that follow still find {{token}}.
+    const back = saved.body.variables.map((v) =>
+      v.key === 'apiToken' ? { ...v, key: 'token' } : v,
+    );
+    await api('PATCH', `/projects/${projectId}/environments/${environmentId}`, {
+      name: environment.name,
+      variables: back,
+    });
+  });
+
+  await test('a masked secret that matches nothing is refused, not silently wiped', async () => {
+    const refused = await api('PATCH', `/projects/${projectId}/environments/${environmentId}`, {
+      name: 'staging (renamed)',
+      // No id, and a key that was never stored: there is nothing to preserve.
+      variables: [{ key: 'invented', value: '••••', secret: true, enabled: true }],
+    });
+    assertEqual(refused.status, 400, 'refused');
+    assert(refused.body.error.includes('invented'), 'names the variable');
+
+    // And the environment is untouched — a rejected save must not be a partial one.
+    const after = await api('GET', `/projects/${projectId}/environments`);
+    const environment = after.body.environments.find((e) => e.id === environmentId);
+    assert(
+      environment.variables.some((v) => v.key === 'token'),
+      'the original variables are still there',
+    );
+  });
+
   /* ---- requests and running ---------------------------------- */
 
   let requestId;
@@ -421,6 +482,149 @@ try {
     assert(
       listed.body.runs.length <= 20,
       `expected at most 20 stored runs, got ${listed.body.runs.length}`,
+    );
+
+    await api('DELETE', `/projects/${target.id}`);
+  });
+
+  await test('the first latency run becomes the baseline, later ones are compared to it', async () => {
+    const target = (await api('POST', '/projects', { name: 'Baseline' })).body;
+    await api('POST', `/projects/${target.id}/environments`, {
+      name: 'local',
+      variables: [{ key: 'baseUrl', value: fixture.base, enabled: true, secret: false }],
+    });
+    const env = (await api('GET', `/projects/${target.id}/environments`)).body.environments[0];
+    await api('POST', `/projects/${target.id}/requests`, {
+      name: 'items',
+      method: 'GET',
+      url: '{{baseUrl}}/good/items',
+    });
+
+    const first = await api('POST', '/verify', {
+      projectId: target.id,
+      suites: ['latency'],
+      environmentIds: [env.id],
+    });
+    assertEqual(first.body.latency.comparedAgainst, null, 'nothing to compare the first run to');
+    assert(first.body.latency.measurements['GET /good/items'], 'the endpoint was timed');
+
+    // Saved automatically, because a baseline nobody remembered to save is a regression check
+    // that never runs.
+    const saved = await api('GET', `/verify/${target.id}/baseline`);
+    assert(saved.body.baseline, 'the first run was stored as the baseline');
+
+    const second = await api('POST', '/verify', {
+      projectId: target.id,
+      suites: ['latency'],
+      environmentIds: [env.id],
+    });
+    assert(second.body.latency.comparedAgainst !== null, 'the second run had a baseline');
+
+    await api('DELETE', `/projects/${target.id}`);
+  });
+
+  await test('promoting a run to the baseline is explicit and validated', async () => {
+    const target = (await api('POST', '/projects', { name: 'Promote' })).body;
+    await api('POST', `/projects/${target.id}/environments`, {
+      name: 'local',
+      variables: [{ key: 'baseUrl', value: fixture.base, enabled: true, secret: false }],
+    });
+    const env = (await api('GET', `/projects/${target.id}/environments`)).body.environments[0];
+    await api('POST', `/projects/${target.id}/requests`, {
+      name: 'items',
+      method: 'GET',
+      url: '{{baseUrl}}/good/items',
+    });
+
+    const contractOnly = await api('POST', '/verify', {
+      projectId: target.id,
+      suites: ['contract'],
+      environmentIds: [env.id],
+    });
+
+    // A run with no timings cannot become a timing baseline, and says why rather than
+    // storing an empty one.
+    const refused = await api('POST', `/verify/${target.id}/baseline`, {
+      runId: contractOnly.body.id,
+    });
+    assertEqual(refused.status, 400, 'refused');
+    assert(refused.body.error.includes('latency suite'), 'explains what was missing');
+
+    const missing = await api('POST', `/verify/${target.id}/baseline`, { runId: 'nope' });
+    assertEqual(missing.status, 404, 'an unknown run is a 404');
+
+    const timed = await api('POST', '/verify', {
+      projectId: target.id,
+      suites: ['latency'],
+      environmentIds: [env.id],
+    });
+    const promoted = await api('POST', `/verify/${target.id}/baseline`, {
+      runId: timed.body.id,
+    });
+    assertEqual(promoted.status, 201, 'promoted');
+    assertEqual(promoted.body.baseline.fromRunId, timed.body.id, 'records which run it came from');
+
+    await api('DELETE', `/projects/${target.id}`);
+  });
+
+  await test('a scenario round-trips and runs its steps in order', async () => {
+    const target = (await api('POST', '/projects', { name: 'Workflow' })).body;
+    await api('POST', `/projects/${target.id}/environments`, {
+      name: 'local',
+      variables: [{ key: 'baseUrl', value: fixture.base, enabled: true, secret: false }],
+    });
+    const env = (await api('GET', `/projects/${target.id}/environments`)).body.environments[0];
+
+    const create = (
+      await api('POST', `/projects/${target.id}/requests`, {
+        name: 'create widget',
+        method: 'POST',
+        url: '{{baseUrl}}/good/widgets',
+        body: { type: 'json', content: '{"name":"from-scenario"}' },
+        captures: [{ name: 'widgetId', from: 'body', path: 'id' }],
+        assertions: [{ type: 'status', operator: 'equals', expected: '201' }],
+      })
+    ).body;
+
+    const read = (
+      await api('POST', `/projects/${target.id}/requests`, {
+        name: 'read it back',
+        method: 'GET',
+        url: '{{baseUrl}}/echo',
+        params: [{ key: 'widget', value: '{{widgetId}}', enabled: true }],
+      })
+    ).body;
+
+    const scenario = (
+      await api('POST', `/scenarios/${target.id}`, {
+        name: 'Create then read',
+        steps: [{ requestId: create.id }, { requestId: read.id }],
+      })
+    ).body;
+
+    const listed = await api('GET', `/scenarios/${target.id}`);
+    assertEqual(listed.body.scenarios.length, 1, 'the scenario was stored');
+
+    const run = await api('POST', `/scenarios/${target.id}/${scenario.id}/run`, {
+      environmentId: env.id,
+    });
+    assertEqual(run.status, 201, 'ran');
+    assertEqual(run.body.passed, true, `steps: ${JSON.stringify(run.body.steps)}`);
+
+    // The capture from step one has to be what step two sent, or the whole point of an
+    // ordered run is missing.
+    const echoed = JSON.parse(run.body.steps[1].body);
+    assert(echoed.query.widget?.startsWith('w'), `captured id not used: ${echoed.query.widget}`);
+
+    const runs = await api('GET', `/scenarios/${target.id}/${scenario.id}/runs`);
+    assertEqual(runs.body.runs.length, 1, 'the run was stored');
+
+    await api('DELETE', `/scenarios/${target.id}/${scenario.id}`);
+    assertEqual((await api('GET', `/scenarios/${target.id}`)).body.scenarios.length, 0, 'deleted');
+    assertEqual(
+      (await api('GET', `/scenarios/${target.id}/${scenario.id}/runs`)).body.runs.length,
+      0,
+      'and its runs went with it',
     );
 
     await api('DELETE', `/projects/${target.id}`);

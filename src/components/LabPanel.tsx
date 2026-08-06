@@ -21,7 +21,34 @@ const SUITES = [
     blurb:
       'Replays each request with a second user’s credentials, and with none at all. If the second user gets the first user’s data back, anyone can read anyone’s by changing an id in the URL — known as an insecure direct object reference (IDOR). Needs two environments holding different users’ credentials.',
   },
+  {
+    id: 'pagination',
+    label: 'Pagination — does walking every page give you every record?',
+    blurb:
+      'Walks the pages of any request that returns a list and checks the boundaries: records returned twice, records skipped, a total that moves while you page, a page size that is ignored, and what happens past the last page. Read-only.',
+  },
+  {
+    id: 'idempotency',
+    label: 'Idempotency — is it safe to send the same request twice?',
+    blurb:
+      'Repeats each PUT and DELETE, and any create carrying an Idempotency-Key, then compares the results. Catches a PUT that increments rather than sets, a delete that errors the second time, and a key that is accepted but ignored. This one genuinely writes twice.',
+  },
+  {
+    id: 'caching',
+    label: 'Caching',
+    blurb:
+      'Checks each GET for an ETag or Last-Modified, confirms a conditional re-request actually returns 304, and flags an authenticated response that a shared proxy is allowed to store and serve to someone else.',
+  },
+  {
+    id: 'latency',
+    label: 'Latency — has anything got slower?',
+    blurb:
+      'Times each GET over a dozen sequential requests and compares the percentiles against the saved baseline. The first run becomes the baseline; after that, promoting a run is deliberate. Not load testing — only reads are repeated.',
+  },
 ] as const;
+
+/** Kept in step with INTRUSIVE_SUITES in server/verify/runner.js. */
+const INTRUSIVE: string[] = ['negative', 'authz', 'idempotency'];
 
 const TONE: Record<string, string> = {
   blocker: 'text-rose-400',
@@ -38,7 +65,15 @@ const TONE: Record<string, string> = {
  * the user confirms it is theirs to test.
  */
 export default function LabPanel({ onClose }: { onClose: () => void }) {
-  const { project, environments, environmentId, runVerification, loadRuns, runs } = useStore();
+  const {
+    project,
+    environments,
+    environmentId,
+    runVerification,
+    saveLatencyBaseline,
+    loadRuns,
+    runs,
+  } = useStore();
 
   const [selected, setSelected] = useState<string[]>(['negative']);
   // Defaults to whatever is selected in the header. Without this the lab sent no environment
@@ -52,6 +87,7 @@ export default function LabPanel({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [run, setRun] = useState<VerifyRun | null>(null);
+  const [baselineSaved, setBaselineSaved] = useState(false);
 
   useEffect(() => {
     if (project) void loadRuns(project.id);
@@ -64,6 +100,7 @@ export default function LabPanel({ onClose }: { onClose: () => void }) {
     if (!project) return;
     setBusy(true);
     setError(null);
+    setBaselineSaved(false);
 
     const result = await runVerification({
       projectId: project.id,
@@ -85,9 +122,10 @@ export default function LabPanel({ onClose }: { onClose: () => void }) {
     else setRun(result);
   };
 
-  // Only the intrusive suites need the acknowledgement. Contract conformance sends the
-  // documented requests and compares responses, which is what any consumer does anyway.
-  const intrusive = selected.filter((s) => s === 'negative' || s === 'authz');
+  // Only the intrusive suites need the acknowledgement. Contract, pagination and caching send
+  // the documented requests, walk pages and re-request with a conditional header, which is
+  // what any consumer does anyway. Idempotency repeats writes, so it belongs with the rest.
+  const intrusive = selected.filter((s) => INTRUSIVE.includes(s));
   const needsAcknowledgement = intrusive.length > 0;
 
   const reportUrl = (format: string) =>
@@ -328,6 +366,61 @@ export default function LabPanel({ onClose }: { onClose: () => void }) {
                   </li>
                 ))}
               </ul>
+            )}
+
+            {run.latency && Object.keys(run.latency.measurements).length > 0 && (
+              <div className="rounded border border-slate-800 bg-slate-950/40 p-2">
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="text-xs text-slate-300">
+                    Timings{' '}
+                    <span className="text-slate-600">
+                      {run.latency.comparedAgainst
+                        ? `compared against the baseline saved ${new Date(
+                            run.latency.comparedAgainst,
+                          ).toLocaleString()}`
+                        : 'recorded as the baseline'}
+                    </span>
+                  </span>
+                  {/* Promoting a run is explicit: adopting a slower run as the new normal is a
+                      decision, and a baseline that updated itself every run would never show a
+                      regression that arrived gradually. */}
+                  {run.latency.comparedAgainst !== null && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (!project) return;
+                        const ok = await saveLatencyBaseline(project.id, run.id);
+                        if (ok) setBaselineSaved(true);
+                      }}
+                      className="rounded border border-slate-700 px-2 py-0.5 text-xs text-slate-300 hover:border-slate-500"
+                    >
+                      {baselineSaved ? 'Saved as baseline' : 'Save these as the baseline'}
+                    </button>
+                  )}
+                </div>
+                <table className="w-full text-left text-xs text-slate-400">
+                  <thead className="text-slate-600">
+                    <tr>
+                      <th className="py-0.5 font-normal">endpoint</th>
+                      <th className="py-0.5 text-right font-normal">p50</th>
+                      <th className="py-0.5 text-right font-normal">p95</th>
+                      <th className="py-0.5 text-right font-normal">p99</th>
+                      <th className="py-0.5 text-right font-normal">n</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.entries(run.latency.measurements).map(([endpoint, stats]) => (
+                      <tr key={endpoint} className="border-t border-slate-800/60">
+                        <td className="py-0.5 font-mono text-slate-300">{endpoint}</td>
+                        <td className="py-0.5 text-right">{stats.p50}ms</td>
+                        <td className="py-0.5 text-right">{stats.p95}ms</td>
+                        <td className="py-0.5 text-right">{stats.p99}ms</td>
+                        <td className="py-0.5 text-right text-slate-600">{stats.samples}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
 
             <div className="max-h-96 overflow-auto rounded border border-slate-800">

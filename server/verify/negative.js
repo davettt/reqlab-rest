@@ -50,7 +50,15 @@ export async function runNegative({ send, requests }) {
       // Every error response is checked for leakage, whatever its status.
       if (status >= 400) {
         checkLeakage({ findings, request, testCase, run, body });
-        errorShapes.push({ endpoint: label(request), status, shape: shapeOf(body) });
+        errorShapes.push({
+          endpoint: label(request),
+          status,
+          shape: shapeOf(body),
+          // The case and the response are what make the finding actionable: "two shapes were
+          // seen" tells the reader nothing they can go and look at.
+          caseName: testCase.name,
+          run,
+        });
       }
 
       if (!testCase.expected.includes(status)) {
@@ -189,23 +197,51 @@ function casesFor(request) {
   }
 
   cases.push({
-    name: 'an unsupported method',
-    whatWeSent: `The endpoint was called with TRACE instead of ${request.method}.`,
+    name: `an unsupported method (${wrongMethodFor(request)})`,
+    whatWeSent: `The endpoint was called with ${wrongMethodFor(request)} instead of ${request.method}.`,
     request: {
       ...request,
-      method: 'TRACE',
+      method: wrongMethodFor(request),
       body: { type: 'none' },
-      name: `${request.name} (TRACE)`,
+      name: `${request.name} (${wrongMethodFor(request)})`,
     },
-    expected: [404, 405, 501, 400],
+    // 404 is deliberately not accepted. The path came from this project, so it exists and
+    // answers its documented method — telling a caller "Not Found" for a different method
+    // says the endpoint is not there, which is a different and misleading fact.
+    expected: [405, 501],
     whyItMatters: (status) =>
       status < 400
         ? 'The endpoint answered a method it does not document, which usually means the route ' +
           'is wired more broadly than intended.'
-        : `An unsupported method should be 405 (or 404), not ${status}.`,
+        : status === 404
+          ? 'Defensible, but worth a decision rather than a default. Answering 404 refuses to ' +
+            'confirm the path exists, which is deliberate hardening on an undocumented ' +
+            'endpoint — but this path is published, so it conceals nothing from anyone reading ' +
+            'the specification and only misleads an integrator, who checks their URL, their ' +
+            'deployment and their credentials before noticing they used the wrong method. ' +
+            '405 with an Allow header names the actual mistake. Note that 405 without Allow is ' +
+            'worse than either: it confirms the path and still does not say what to use.'
+          : `An unsupported method should be answered with 405, not ${status}.`,
   });
 
   return cases;
+}
+
+/**
+ * Which method to send at an endpoint that does not document it.
+ *
+ * GET wherever possible: it is the mistake a real client actually makes, it reaches the
+ * application's own routing, and it is safe by definition — if the API does happen to
+ * implement GET on that path, reading is all that happens.
+ *
+ * TRACE only when the request is itself a GET, because then every alternative (POST, PUT,
+ * DELETE) risks changing data on an endpoint we know nothing about. TRACE is the safe choice
+ * there, at the cost of a weaker test: it is blocked at the edge by most proxies and WAFs —
+ * correctly, since it enables cross-site tracing — so the answer usually comes from the
+ * infrastructure rather than from the API.
+ */
+function wrongMethodFor(request) {
+  return (request.method ?? 'GET').toUpperCase() === 'GET' ? 'TRACE' : 'GET';
 }
 
 /**
@@ -291,22 +327,88 @@ function shapeOf(body) {
 }
 
 function checkErrorShapeConsistency({ findings, errorShapes }) {
-  const shapes = new Set(errorShapes.map((e) => e.shape));
-  if (shapes.size <= 1) return;
+  const byShape = new Map();
+  for (const entry of errorShapes) {
+    if (!byShape.has(entry.shape)) byShape.set(entry.shape, []);
+    byShape.get(entry.shape).push(entry);
+  }
+
+  if (byShape.size <= 1) return;
+
+  // Which shape is the odd one out: the one produced by the fewest cases is what the reader
+  // needs to go and look at, and it is what the evidence should show.
+  const ordered = [...byShape.entries()].sort((a, b) => b[1].length - a[1].length);
+  const oddEntries = ordered[ordered.length - 1][1];
+
+  const describe = ([shape, entries]) =>
+    `${shape === 'non-json' ? 'not JSON at all' : shape} — ` +
+    entries
+      .slice(0, 3)
+      .map((e) => `${e.status} from ${e.caseName}`)
+      .join(', ') +
+    (entries.length > 3 ? `, and ${entries.length - 3} more` : '');
+
+  /**
+   * A body that is not JSON is a different problem from a body with different keys.
+   *
+   * Different keys make a caller write a second branch. Something that is not JSON at all
+   * makes their JSON parse throw, so the error they surface is a parse failure rather than
+   * what the API said.
+   *
+   * But *where* the non-JSON came from changes what it means. A proxy answering at the edge —
+   * nginx returning its own 405 page, a WAF blocking a method — is usually deliberate
+   * hardening, and reporting it as an application defect sends the reader to the wrong team.
+   * The API's own handler returning HTML is the serious version.
+   */
+  const nonJson = byShape.has('non-json');
+  const fromEdge = nonJson && (byShape.get('non-json') ?? []).every(looksLikeInfrastructure);
 
   findings.push(
     finding({
       suite: SUITE,
-      severity: 'minor',
+      severity: nonJson && !fromEdge ? 'major' : 'minor',
       endpoint: null,
-      title: 'Error responses do not share a consistent shape',
-      whatHappened: `${shapes.size} different error body shapes were seen: ${[...shapes].join(' / ')}.`,
-      whyItMatters:
-        'Callers write one error handler. When the shape varies by endpoint they either write ' +
-        'several, or miss cases and surface a blank message to their users.',
+      title: fromEdge
+        ? 'Some errors are answered by infrastructure, not by the API'
+        : nonJson
+          ? 'Some error responses are not JSON'
+          : 'Error responses do not share a consistent shape',
+      whatHappened:
+        `${byShape.size} different error body shapes were seen. ` +
+        ordered.map(describe).join('. ') +
+        '.',
+      whyItMatters: fromEdge
+        ? 'The non-JSON responses carry a web-server error page rather than the API’s own ' +
+          'envelope, which means something in front of the application answered first. That ' +
+          'is often deliberate — blocking a method at the edge is sound hardening — so this ' +
+          'is worth confirming rather than fixing outright. It only matters to a caller if ' +
+          'they can reach it by accident; if the documentation promises the same error ' +
+          'envelope on every request to the path, this is where that promise stops holding.'
+        : nonJson
+          ? 'A caller parsing the error body will throw on the responses that are not JSON, so ' +
+            'the message their user sees is a parse failure rather than anything the API said. ' +
+            'The application itself returned this, so it is the API’s own error handling that ' +
+            'is inconsistent rather than a layer in front of it.'
+          : 'Callers write one error handler. When the shape varies they either write several, ' +
+            'or miss cases and surface a blank message to their users.',
       expected: 'one error shape',
-      actual: `${shapes.size} shapes`,
+      actual: `${byShape.size} shapes`,
+      // The minority shape, which is the one worth opening.
+      evidence: oddEntries[0]?.run ? evidenceFrom(oddEntries[0].run) : null,
     }),
+  );
+}
+
+/** A default web-server error page: an HTML body, from something naming itself in `server`. */
+function looksLikeInfrastructure(entry) {
+  const headers = entry.run?.response?.headers ?? {};
+  const contentType = String(headers['content-type'] ?? '');
+  const server = String(headers.server ?? '');
+  const body = String(entry.run?.response?.body ?? '');
+
+  return (
+    contentType.includes('html') &&
+    (Boolean(server) || /<center>|<hr>|nginx|Apache|IIS|Envoy|cloudflare/i.test(body))
   );
 }
 
